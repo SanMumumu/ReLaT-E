@@ -1,0 +1,125 @@
+experiment:
+  name: relat_e_rgbd
+  output: ./results_relat_e
+  seed: 42
+  resume: false
+  n_gpus: 1
+
+data:
+  name: CITYSCAPES_RGBD
+  data_folder: /mnt/nodestor/ws/UniWM/DATA/data
+  resolution: 128
+  video_len: 30
+  cond_frames: 2
+  pred_frames: 8
+  batch_size: 1
+  num_workers: 8
+  depth_in_channels: 3
+  depth_out_channels: 3
+  max_size: null
+
+rgb_vae:
+  embed_dim: 4
+  bn_momentum: 0.1
+  channels: 192
+  resolution: 128
+  frames: 8
+  in_channels: 3
+  out_channels: 3
+  splits: 1
+  layers: 8
+  kl_weight: 1.0e-6
+
+depth_vae:
+  embed_dim: 4
+  bn_momentum: 0.1
+  channels: 192
+  resolution: 128
+  frames: 8
+  in_channels: 3
+  out_channels: 3
+  splits: 1
+  layers: 8
+  kl_weight: 1.0e-6
+
+generator:
+  scale: base
+  mot:
+    input_size: 32
+    in_channels: 4
+    hidden_size: 768
+    depth: 12
+    num_heads: 12
+    aligned_depth: 4
+    bn_momentum: 0.1
+    use_qknorm: true
+    use_swiglu: true
+    use_rmsnorm: true
+    wo_shift: true
+    fused_attn: true
+    use_rope: false
+    same_noise: true
+
+teachers:
+  rgb:
+    name: patch_tokens
+    target_dim: 768
+    patch_size: 16
+    normalize: imagenet
+    ckpt_dir: ./ckpts
+  depth:
+    name: patch_tokens
+    target_dim: 768
+    patch_size: 16
+    normalize: depth
+    ckpt_dir: ./ckpts
+
+loss:
+  flow:
+    weight: 1.0
+    sigma_min: 1.0e-5
+    sampling_timesteps: 50
+  relation:
+    weight: 1.0
+    beta_spatial: 1.0
+    beta_temporal: 1.0
+  recon:
+    rgb:
+      mse_weight: 1.0
+      l1_weight: 4.0
+      perceptual_weight: 4.0
+      kl_weight: 1.0
+    depth:
+      mse_weight: 1.0
+      l1_weight: 4.0
+      perceptual_weight: 0.0
+      kl_weight: 1.0
+
+partial_conditioning:
+  probs:
+    full: 0.5
+    rgb_only: 0.25
+    depth_only: 0.25
+
+optim:
+  lr_vae: 1.0e-4
+  lr_generator: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  max_iter: 250000
+  log_freq: 500
+  eval_freq: 5000
+  save_freq: 10000
+  amp: true
+  grad_clip: 1.0
+  save_memory: false
+  teacher_chunk_size: 0
+
+ema:
+  decay: 0.9999
+
+eval:
+  eval_samples: 16
+  future_frames: 28
+  sampling_timesteps: 50
+  cfg_scale: 1.0
