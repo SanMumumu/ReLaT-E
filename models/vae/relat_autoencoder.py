@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from models.vae.vae_3d import Conv3DAutoencoder
 
@@ -42,16 +41,9 @@ class Relat3DVAE(nn.Module):
         return x[:, :, :frames]
 
     def _apply_bn(self, z, bn):
-        return F.batch_norm(
-            z,
-            bn.running_mean.float(),
-            bn.running_var.float(),
-            weight=None,
-            bias=None,
-            training=False,
-            momentum=0.0,
-            eps=self.bn_eps,
-        )
+        mean = bn.running_mean.detach().clone().view(1, -1, 1).to(device=z.device, dtype=z.dtype)
+        var = bn.running_var.detach().clone().view(1, -1, 1).to(device=z.device, dtype=z.dtype)
+        return (z - mean) / torch.sqrt(var + self.bn_eps)
 
     def _apply_cond_bn(self, z):
         is_uncond = z.abs().amax(dim=(1, 2), keepdim=True) < 1e-12

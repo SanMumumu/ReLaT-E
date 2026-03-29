@@ -169,9 +169,24 @@ def run(rank, cfg, ckpt_path=None):
         set_requires_grad(ema_generator, False)
 
         if distributed:
-            rgb_vae = nn.parallel.DistributedDataParallel(rgb_vae, device_ids=[rank], find_unused_parameters=False)
-            depth_vae = nn.parallel.DistributedDataParallel(depth_vae, device_ids=[rank], find_unused_parameters=False)
-            generator = nn.parallel.DistributedDataParallel(generator, device_ids=[rank], find_unused_parameters=False)
+            rgb_vae = nn.parallel.DistributedDataParallel(
+                rgb_vae,
+                device_ids=[rank],
+                find_unused_parameters=False,
+                broadcast_buffers=False,
+            )
+            depth_vae = nn.parallel.DistributedDataParallel(
+                depth_vae,
+                device_ids=[rank],
+                find_unused_parameters=False,
+                broadcast_buffers=False,
+            )
+            generator = nn.parallel.DistributedDataParallel(
+                generator,
+                device_ids=[rank],
+                find_unused_parameters=False,
+                broadcast_buffers=False,
+            )
 
         rgb_recon_loss = AutoencoderReconstructionLoss(
             mse_weight=cfg.loss.recon.rgb.mse_weight,
