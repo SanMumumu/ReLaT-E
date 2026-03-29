@@ -4,8 +4,50 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from models.fm.DiT import DiTBlock, FinalLayer, TriplaneRoPE
+from models.fm.DiT import DiTBlock, FinalLayer
 from models.fm.utils import timestep_embedding
+
+
+class VolumeRoPE(nn.Module):
+    def __init__(self, head_dim, frames, input_size, base=10000):
+        super().__init__()
+        assert head_dim % 2 == 0, "head_dim must be divisible by 2"
+
+        d_t = (head_dim // 3) // 2 * 2
+        d_y = (head_dim // 3) // 2 * 2
+        d_x = head_dim - d_t - d_y
+        if d_x % 2 != 0:
+            d_x -= 1
+            d_y += 1
+        if min(d_t, d_y, d_x) <= 0:
+            raise ValueError("head_dim is too small for 3D rotary embedding.")
+
+        inv_freq_t = 1.0 / (base ** (torch.arange(0, d_t, 2).float() / d_t))
+        inv_freq_y = 1.0 / (base ** (torch.arange(0, d_y, 2).float() / d_y))
+        inv_freq_x = 1.0 / (base ** (torch.arange(0, d_x, 2).float() / d_x))
+
+        t_coords = torch.arange(frames).view(frames, 1, 1).expand(frames, input_size, input_size).reshape(-1).float()
+        y_coords = torch.arange(input_size).view(1, input_size, 1).expand(frames, input_size, input_size).reshape(-1).float()
+        x_coords = torch.arange(input_size).view(1, 1, input_size).expand(frames, input_size, input_size).reshape(-1).float()
+
+        freqs_half = torch.cat(
+            [
+                torch.outer(t_coords, inv_freq_t),
+                torch.outer(y_coords, inv_freq_y),
+                torch.outer(x_coords, inv_freq_x),
+            ],
+            dim=-1,
+        )
+        freqs = torch.cat([freqs_half, freqs_half], dim=-1)
+        self.register_buffer("cos_cached", freqs.cos().unsqueeze(0).unsqueeze(0))
+        self.register_buffer("sin_cached", freqs.sin().unsqueeze(0).unsqueeze(0))
+
+    def forward(self, x):
+        cos = self.cos_cached[:, :, : x.size(2), :]
+        sin = self.sin_cached[:, :, : x.size(2), :]
+        x1, x2 = x.chunk(2, dim=-1)
+        rotated = torch.cat((-x2, x1), dim=-1)
+        return (x * cos) + (rotated * sin)
 
 
 class TokenProjectionHead(nn.Module):
@@ -21,10 +63,11 @@ class TokenProjectionHead(nn.Module):
         return self.net(hidden.transpose(1, 2)).transpose(1, 2)
 
 
-class MoTBlock(nn.Module):
+class DiTStream(nn.Module):
     def __init__(
         self,
         hidden_size,
+        depth,
         num_heads,
         use_qknorm=True,
         use_swiglu=True,
@@ -32,67 +75,56 @@ class MoTBlock(nn.Module):
         wo_shift=True,
         fused_attn=True,
         use_rope=False,
-        frames=8,
-        input_size=32,
+        frames=4,
+        input_size=16,
+        use_checkpoint=False,
     ):
         super().__init__()
-        self.rgb_branch = DiTBlock(
-            hidden_size,
-            num_heads,
-            use_qknorm=use_qknorm,
-            use_swiglu=use_swiglu,
-            use_rmsnorm=use_rmsnorm,
-            wo_shift=wo_shift,
-            fused_attn=fused_attn,
+        self.use_checkpoint = use_checkpoint
+        self.blocks = nn.ModuleList(
+            [
+                DiTBlock(
+                    hidden_size,
+                    num_heads,
+                    use_qknorm=use_qknorm,
+                    use_swiglu=use_swiglu,
+                    use_rmsnorm=use_rmsnorm,
+                    wo_shift=wo_shift,
+                    fused_attn=fused_attn,
+                )
+                for _ in range(depth)
+            ]
         )
-        self.depth_branch = DiTBlock(
-            hidden_size,
-            num_heads,
-            use_qknorm=use_qknorm,
-            use_swiglu=use_swiglu,
-            use_rmsnorm=use_rmsnorm,
-            wo_shift=wo_shift,
-            fused_attn=fused_attn,
-        )
-        self.to_shared_rgb = nn.Linear(hidden_size, hidden_size)
-        self.to_shared_depth = nn.Linear(hidden_size, hidden_size)
-        self.shared_block = DiTBlock(
-            hidden_size,
-            num_heads,
-            use_qknorm=use_qknorm,
-            use_swiglu=use_swiglu,
-            use_rmsnorm=use_rmsnorm,
-            wo_shift=wo_shift,
-            fused_attn=fused_attn,
-        )
-        self.from_shared_rgb = nn.Linear(hidden_size, hidden_size)
-        self.from_shared_depth = nn.Linear(hidden_size, hidden_size)
-        self.feat_rope = TriplaneRoPE(hidden_size // num_heads, frames, input_size) if use_rope else None
+        self.feat_rope = VolumeRoPE(hidden_size // num_heads, frames, input_size) if use_rope else None
 
-    def forward(self, rgb, depth, t_rgb, t_depth, t_shared):
-        rgb = self.rgb_branch(rgb, t_rgb, feat_rope=self.feat_rope)
-        depth = self.depth_branch(depth, t_depth, feat_rope=self.feat_rope)
+    def _run_block(self, block, x, t_emb):
+        if self.use_checkpoint and self.training:
+            return checkpoint(
+                lambda x_, t_: block(x_, t_, feat_rope=self.feat_rope),
+                x,
+                t_emb,
+                use_reentrant=False,
+            )
+        return block(x, t_emb, feat_rope=self.feat_rope)
 
-        shared_rgb = self.to_shared_rgb(rgb)
-        shared_depth = self.to_shared_depth(depth)
-        shared = torch.cat([shared_rgb, shared_depth], dim=1)
-        shared = self.shared_block(shared, t_shared, feat_rope=None)
-        shared_rgb, shared_depth = torch.split(shared, [rgb.size(1), depth.size(1)], dim=1)
-
-        rgb = rgb + self.from_shared_rgb(shared_rgb)
-        depth = depth + self.from_shared_depth(shared_depth)
-        return rgb, depth
+    def forward(self, x, t_emb, capture_layer=None):
+        hidden = None
+        for index, block in enumerate(self.blocks, start=1):
+            x = self._run_block(block, x, t_emb)
+            if capture_layer is not None and index == capture_layer:
+                hidden = x
+        return x, hidden
 
 
 class ReLaTMoT(nn.Module):
     def __init__(
         self,
-        input_size=32,
+        input_size=16,
         in_channels=4,
         hidden_size=768,
         depth=12,
         num_heads=12,
-        frames=8,
+        frames=4,
         aligned_depth=4,
         rgb_teacher_dim=768,
         depth_teacher_dim=768,
@@ -112,12 +144,8 @@ class ReLaTMoT(nn.Module):
         self.input_size = input_size
         self.aligned_depth = aligned_depth
         self.same_noise = same_noise
-        self.use_checkpoint = use_checkpoint
 
-        self.len_xy = input_size * input_size
-        self.len_yt = frames * input_size
-        self.len_xt = frames * input_size
-        self.seq_len = self.len_xy + self.len_yt + self.len_xt
+        self.seq_len = frames * input_size * input_size
         self.ae_emb_dim = self.seq_len
 
         self.rgb_embedder = nn.Linear(in_channels * 2, hidden_size)
@@ -128,26 +156,54 @@ class ReLaTMoT(nn.Module):
             nn.Linear(hidden_size, hidden_size),
         )
         self.pos_embed = nn.Parameter(torch.zeros(1, self.seq_len, hidden_size))
-        self.segment_embed = nn.Parameter(torch.zeros(1, 3, hidden_size))
         self.modality_embed = nn.Embedding(2, hidden_size)
 
-        self.blocks = nn.ModuleList(
-            [
-                MoTBlock(
-                    hidden_size=hidden_size,
-                    num_heads=num_heads,
-                    use_qknorm=use_qknorm,
-                    use_swiglu=use_swiglu,
-                    use_rmsnorm=use_rmsnorm,
-                    wo_shift=wo_shift,
-                    fused_attn=fused_attn,
-                    use_rope=use_rope,
-                    frames=frames,
-                    input_size=input_size,
-                )
-                for _ in range(depth)
-            ]
+        self.rgb_stream = DiTStream(
+            hidden_size=hidden_size,
+            depth=depth,
+            num_heads=num_heads,
+            use_qknorm=use_qknorm,
+            use_swiglu=use_swiglu,
+            use_rmsnorm=use_rmsnorm,
+            wo_shift=wo_shift,
+            fused_attn=fused_attn,
+            use_rope=use_rope,
+            frames=frames,
+            input_size=input_size,
+            use_checkpoint=use_checkpoint,
         )
+        self.depth_stream = DiTStream(
+            hidden_size=hidden_size,
+            depth=depth,
+            num_heads=num_heads,
+            use_qknorm=use_qknorm,
+            use_swiglu=use_swiglu,
+            use_rmsnorm=use_rmsnorm,
+            wo_shift=wo_shift,
+            fused_attn=fused_attn,
+            use_rope=use_rope,
+            frames=frames,
+            input_size=input_size,
+            use_checkpoint=use_checkpoint,
+        )
+        self.to_shared_rgb = nn.Linear(hidden_size, hidden_size)
+        self.to_shared_depth = nn.Linear(hidden_size, hidden_size)
+        self.shared_stream = DiTStream(
+            hidden_size=hidden_size,
+            depth=depth,
+            num_heads=num_heads,
+            use_qknorm=use_qknorm,
+            use_swiglu=use_swiglu,
+            use_rmsnorm=use_rmsnorm,
+            wo_shift=wo_shift,
+            fused_attn=fused_attn,
+            use_rope=False,
+            frames=frames,
+            input_size=input_size,
+            use_checkpoint=use_checkpoint,
+        )
+        self.from_shared_rgb = nn.Linear(hidden_size, hidden_size)
+        self.from_shared_depth = nn.Linear(hidden_size, hidden_size)
 
         self.rgb_relation_head = TokenProjectionHead(hidden_size, rgb_teacher_dim)
         self.depth_relation_head = TokenProjectionHead(hidden_size, depth_teacher_dim)
@@ -157,20 +213,16 @@ class ReLaTMoT(nn.Module):
 
     def initialize_weights(self):
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        nn.init.trunc_normal_(self.segment_embed, std=0.02)
         nn.init.trunc_normal_(self.modality_embed.weight, std=0.02)
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
-        for block in self.blocks:
-            nn.init.constant_(block.rgb_branch.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.rgb_branch.adaLN_modulation[-1].bias, 0)
-            nn.init.constant_(block.depth_branch.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.depth_branch.adaLN_modulation[-1].bias, 0)
-            nn.init.constant_(block.shared_block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.shared_block.adaLN_modulation[-1].bias, 0)
+        for stream in (self.rgb_stream, self.depth_stream, self.shared_stream):
+            for block in stream.blocks:
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.rgb_final.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.rgb_final.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.rgb_final.linear.weight, 0)
@@ -180,22 +232,12 @@ class ReLaTMoT(nn.Module):
         nn.init.constant_(self.depth_final.linear.weight, 0)
         nn.init.constant_(self.depth_final.linear.bias, 0)
 
-    def _segment_indices(self, device):
-        return torch.cat(
-            [
-                torch.zeros(self.len_xy, device=device).long(),
-                torch.ones(self.len_yt, device=device).long(),
-                torch.full((self.len_xt,), 2, device=device).long(),
-            ]
-        )
-
     def _prepare_tokens(self, x, cond, embedder, modality_index):
         if cond is None:
             cond = torch.zeros_like(x)
         x = torch.cat([x, cond], dim=1).transpose(1, 2)
         x = embedder(x)
-        x = x + self.pos_embed[:, :x.size(1)]
-        x = x + self.segment_embed[:, self._segment_indices(x.device)]
+        x = x + self.pos_embed[:, : x.size(1)]
         modality = self.modality_embed.weight[modality_index].view(1, 1, -1)
         return x + modality
 
@@ -205,18 +247,13 @@ class ReLaTMoT(nn.Module):
         t_shared = 0.5 * (t_rgb_emb + t_depth_emb)
         return t_rgb_emb, t_depth_emb, t_shared
 
-    def _run_block(self, block, rgb, depth, t_rgb_emb, t_depth_emb, t_shared):
-        if self.use_checkpoint and self.training:
-            return checkpoint(
-                lambda rgb_, depth_, t_rgb_, t_depth_, t_shared_: block(rgb_, depth_, t_rgb_, t_depth_, t_shared_),
-                rgb,
-                depth,
-                t_rgb_emb,
-                t_depth_emb,
-                t_shared,
-                use_reentrant=False,
-            )
-        return block(rgb, depth, t_rgb_emb, t_depth_emb, t_shared)
+    def _fuse_streams(self, rgb, depth, t_shared):
+        shared = torch.cat([self.to_shared_rgb(rgb), self.to_shared_depth(depth)], dim=1)
+        shared, _ = self.shared_stream(shared, t_shared, capture_layer=None)
+        shared_rgb, shared_depth = torch.split(shared, [rgb.size(1), depth.size(1)], dim=1)
+        rgb = rgb + self.from_shared_rgb(shared_rgb)
+        depth = depth + self.from_shared_depth(shared_depth)
+        return rgb, depth
 
     def forward(
         self,
@@ -236,22 +273,21 @@ class ReLaTMoT(nn.Module):
 
         rgb = self._prepare_tokens(z_rgb_t, cond_rgb, self.rgb_embedder, modality_index=0)
         depth = self._prepare_tokens(z_depth_t, cond_depth, self.depth_embedder, modality_index=1)
-        hidden_rgb = None
-        hidden_depth = None
-        for index, block in enumerate(self.blocks, start=1):
-            rgb, depth = self._run_block(block, rgb, depth, t_rgb_emb, t_depth_emb, t_shared)
-            if index == self.aligned_depth:
-                hidden_rgb = rgb
-                hidden_depth = depth
+
+        rgb, hidden_rgb = self.rgb_stream(rgb, t_rgb_emb, capture_layer=self.aligned_depth)
+        depth, hidden_depth = self.depth_stream(depth, t_depth_emb, capture_layer=self.aligned_depth)
+        rgb, depth = self._fuse_streams(rgb, depth, t_shared)
 
         v_rgb = self.rgb_final(rgb, t_rgb_emb).transpose(1, 2)
         v_depth = self.depth_final(depth, t_depth_emb).transpose(1, 2)
         outputs = {"v_rgb": v_rgb, "v_depth": v_depth}
-        if return_features and hidden_rgb is not None and hidden_depth is not None:
-            outputs["hidden_rgb"] = hidden_rgb
-            outputs["hidden_depth"] = hidden_depth
-            outputs["aligned_rgb"] = self.rgb_relation_head(hidden_rgb)
-            outputs["aligned_depth"] = self.depth_relation_head(hidden_depth)
+        if return_features:
+            aligned_rgb = hidden_rgb if hidden_rgb is not None else rgb
+            aligned_depth = hidden_depth if hidden_depth is not None else depth
+            outputs["hidden_rgb"] = aligned_rgb
+            outputs["hidden_depth"] = aligned_depth
+            outputs["aligned_rgb"] = self.rgb_relation_head(aligned_rgb)
+            outputs["aligned_depth"] = self.depth_relation_head(aligned_depth)
         return outputs
 
     def forward_sampling(self, z_rgb_t, z_depth_t, cond_rgb, cond_depth, t_rgb, t_depth):

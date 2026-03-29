@@ -3,17 +3,20 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from models.vae.vae_vit_rope import ViTAutoencoder
+from models.vae.vae_3d import Conv3DAutoencoder
 
 
 class Relat3DVAE(nn.Module):
     def __init__(self, embed_dim, vaeconfig, bn_momentum=0.1):
         super().__init__()
-        architecture = str(getattr(vaeconfig, "architecture", vaeconfig.get("architecture", "vit_3d_vae")))
-        if architecture != "vit_3d_vae":
+        architecture = str(getattr(vaeconfig, "architecture", vaeconfig.get("architecture", "conv3d_vae")))
+        if architecture not in {"conv3d_vae", "vit_3d_vae"}:
             raise ValueError(f"Unsupported VAE architecture for ReLaT-E: {architecture}")
-        self.model = ViTAutoencoder(embed_dim, vaeconfig)
+        self.model = Conv3DAutoencoder(embed_dim, vaeconfig)
         self.frames = int(vaeconfig["frames"])
+        self.latent_frames = int(self.model.latent_frames)
+        self.latent_size = int(self.model.latent_size)
+        self.ae_emb_dim = int(self.model.ae_emb_dim)
         self.latent_bn = nn.BatchNorm1d(embed_dim, eps=1e-4, momentum=bn_momentum, affine=False, track_running_stats=True)
         self.cond_latent_bn = nn.BatchNorm1d(embed_dim, eps=1e-4, momentum=bn_momentum, affine=False, track_running_stats=True)
         self.latent_bn.reset_running_stats()

@@ -237,7 +237,7 @@ def rollout_future(batch, rgb_vae, depth_vae, generator, flow, cfg, device, cond
         rgb_cond = rgb_vae.encode_past(rgb_context[:, :, -cond_frames:], normalize=True)
         depth_cond = depth_vae.encode_past(depth_context[:, :, -cond_frames:], normalize=True)
         rgb_cond, depth_cond = build_condition_latents(rgb_cond, depth_cond, prepared["modality_mask"])
-        latent_shape = (cfg.generator.mot.in_channels, unwrap_model(generator).ae_emb_dim)
+        latent_shape = (unwrap_model(generator).in_channels, unwrap_model(generator).ae_emb_dim)
         z_rgb, z_depth = flow.sample(
             generator=generator,
             batch_size=rgb_context.size(0),

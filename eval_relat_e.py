@@ -38,13 +38,18 @@ def main():
 
     rgb_vae = Relat3DVAE(cfg.rgb_vae.embed_dim, cfg.rgb_vae, bn_momentum=cfg.rgb_vae.bn_momentum).to(device)
     depth_vae = Relat3DVAE(cfg.depth_vae.embed_dim, cfg.depth_vae, bn_momentum=cfg.depth_vae.bn_momentum).to(device)
+    if int(cfg.generator.mot.in_channels) != int(cfg.rgb_vae.embed_dim) or int(cfg.generator.mot.in_channels) != int(cfg.depth_vae.embed_dim):
+        raise ValueError("generator.mot.in_channels must match both VAE embed_dim values.")
+    if rgb_vae.latent_size != depth_vae.latent_size or rgb_vae.latent_frames != depth_vae.latent_frames:
+        raise ValueError("RGB and depth VAE latent grids must match for evaluation.")
+    cfg.generator.mot.input_size = rgb_vae.latent_size
     generator = ReLaTMoT(
-        input_size=cfg.generator.mot.input_size,
+        input_size=rgb_vae.latent_size,
         in_channels=cfg.generator.mot.in_channels,
         hidden_size=cfg.generator.mot.hidden_size,
         depth=cfg.generator.mot.depth,
         num_heads=cfg.generator.mot.num_heads,
-        frames=cfg.rgb_vae.frames,
+        frames=rgb_vae.latent_frames,
         aligned_depth=cfg.generator.mot.aligned_depth,
         rgb_teacher_dim=rgb_teacher_dim,
         depth_teacher_dim=depth_teacher_dim,

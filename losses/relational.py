@@ -12,9 +12,7 @@ class RelationalAlignmentLoss(nn.Module):
         self.frames = int(frames)
         self.beta_spatial = float(beta_spatial)
         self.beta_temporal = float(beta_temporal)
-        self.len_xy = self.input_size * self.input_size
-        self.len_yt = self.frames * self.input_size
-        self.len_xt = self.frames * self.input_size
+        self.seq_len = self.frames * self.input_size * self.input_size
 
     def _infer_teacher_grid(self, num_teacher_tokens):
         candidate_ts = []
@@ -51,15 +49,9 @@ class RelationalAlignmentLoss(nn.Module):
             raise ValueError(f"Unable to infer a teacher grid for {num_teacher_tokens} tokens.")
         return best_triplet
 
-    def _sample_triplane(self, student_tokens, teacher_tokens):
+    def _sample_volume(self, student_tokens, teacher_tokens):
         b, _, teacher_dim = student_tokens.shape
-        xy_plane = student_tokens[:, :self.len_xy, :].transpose(1, 2).reshape(b, teacher_dim, self.input_size, self.input_size)
-        yt_plane = student_tokens[:, self.len_xy:self.len_xy + self.len_yt, :].transpose(1, 2).reshape(
-            b, teacher_dim, self.frames, self.input_size
-        )
-        xt_plane = student_tokens[:, self.len_xy + self.len_yt:, :].transpose(1, 2).reshape(
-            b, teacher_dim, self.frames, self.input_size
-        )
+        volume = student_tokens.transpose(1, 2).reshape(b, teacher_dim, self.frames, self.input_size, self.input_size)
 
         _, num_teacher_tokens, _ = teacher_tokens.shape
         t_vfm, h_vfm, w_vfm = self._infer_teacher_grid(num_teacher_tokens)
@@ -67,15 +59,10 @@ class RelationalAlignmentLoss(nn.Module):
         y = torch.linspace(-1, 1, steps=h_vfm, device=student_tokens.device)
         x = torch.linspace(-1, 1, steps=w_vfm, device=student_tokens.device)
         grid_t, grid_y, grid_x = torch.meshgrid(t, y, x, indexing="ij")
+        grid = torch.stack([grid_x, grid_y, grid_t], dim=-1).unsqueeze(0).expand(b, -1, -1, -1, -1)
 
-        grid_xy = torch.stack([grid_x, grid_y], dim=-1).view(1, 1, -1, 2).expand(b, -1, -1, -1)
-        grid_yt = torch.stack([grid_y, grid_t], dim=-1).view(1, 1, -1, 2).expand(b, -1, -1, -1)
-        grid_xt = torch.stack([grid_x, grid_t], dim=-1).view(1, 1, -1, 2).expand(b, -1, -1, -1)
-
-        feat_xy = F.grid_sample(xy_plane, grid_xy, mode="bilinear", align_corners=True).squeeze(2)
-        feat_yt = F.grid_sample(yt_plane, grid_yt, mode="bilinear", align_corners=True).squeeze(2)
-        feat_xt = F.grid_sample(xt_plane, grid_xt, mode="bilinear", align_corners=True).squeeze(2)
-        student = (feat_xy + feat_yt + feat_xt).transpose(1, 2)
+        sampled = F.grid_sample(volume, grid, mode="bilinear", align_corners=True)
+        student = sampled.flatten(2).transpose(1, 2)
         return student, (t_vfm, h_vfm, w_vfm)
 
     def _standardize_teacher(self, teacher_tokens, grid):
@@ -113,7 +100,7 @@ class RelationalAlignmentLoss(nn.Module):
 
     def forward(self, student_tokens, teacher_tokens):
         teacher_tokens = teacher_tokens.detach()
-        aligned_student, grid = self._sample_triplane(student_tokens, teacher_tokens)
+        aligned_student, grid = self._sample_volume(student_tokens, teacher_tokens)
         teacher = self._standardize_teacher(teacher_tokens, grid)
         student = self._normalize_student(aligned_student, grid)
 
