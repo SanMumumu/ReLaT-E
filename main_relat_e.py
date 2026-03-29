@@ -169,9 +169,9 @@ def run(rank, cfg, ckpt_path=None):
         set_requires_grad(ema_generator, False)
 
         if distributed:
-            rgb_vae = nn.parallel.DistributedDataParallel(rgb_vae, device_ids=[rank], find_unused_parameters=True)
-            depth_vae = nn.parallel.DistributedDataParallel(depth_vae, device_ids=[rank], find_unused_parameters=True)
-            generator = nn.parallel.DistributedDataParallel(generator, device_ids=[rank], find_unused_parameters=True)
+            rgb_vae = nn.parallel.DistributedDataParallel(rgb_vae, device_ids=[rank], find_unused_parameters=False)
+            depth_vae = nn.parallel.DistributedDataParallel(depth_vae, device_ids=[rank], find_unused_parameters=False)
+            generator = nn.parallel.DistributedDataParallel(generator, device_ids=[rank], find_unused_parameters=False)
 
         rgb_recon_loss = AutoencoderReconstructionLoss(
             mse_weight=cfg.loss.recon.rgb.mse_weight,
@@ -261,7 +261,7 @@ def run(rank, cfg, ckpt_path=None):
             set_requires_grad(generator, False)
             rgb_vae.train()
             depth_vae.train()
-            generator.train()
+            generator.eval()
             opt_rgb_vae.zero_grad(set_to_none=True)
             opt_depth_vae.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=amp_enabled):
@@ -310,6 +310,7 @@ def run(rank, cfg, ckpt_path=None):
             set_requires_grad(rgb_vae, False)
             set_requires_grad(depth_vae, False)
             set_requires_grad(generator, True)
+            generator.train()
             opt_generator.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=amp_enabled):
                 rgb_cond_detached = rgb_cond.detach()

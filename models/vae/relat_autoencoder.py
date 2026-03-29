@@ -21,6 +21,7 @@ class Relat3DVAE(nn.Module):
         self.cond_latent_bn = nn.BatchNorm1d(embed_dim, eps=1e-4, momentum=bn_momentum, affine=False, track_running_stats=True)
         self.latent_bn.reset_running_stats()
         self.cond_latent_bn.reset_running_stats()
+        self.bn_eps = 1e-4
 
     def _pad_frames(self, x):
         if x.size(2) == self.frames:
@@ -39,18 +40,42 @@ class Relat3DVAE(nn.Module):
             x = x.view(batch, self.frames, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4).contiguous()
         return x[:, :, :frames]
 
+    def _batch_stats(self, z):
+        mean = z.mean(dim=(0, 2))
+        var = z.var(dim=(0, 2), unbiased=False)
+        return mean, var
+
+    def _update_running_stats(self, bn, mean, var):
+        with torch.no_grad():
+            if bn.momentum is None:
+                bn.running_mean.copy_(mean)
+                bn.running_var.copy_(var)
+            else:
+                bn.running_mean.lerp_(mean, bn.momentum)
+                bn.running_var.lerp_(var, bn.momentum)
+
+    def _normalize_with_stats(self, z, mean, var):
+        mean = mean.view(1, -1, 1).to(device=z.device, dtype=z.dtype)
+        var = var.view(1, -1, 1).to(device=z.device, dtype=z.dtype)
+        return (z - mean) / torch.sqrt(var + self.bn_eps)
+
     def _apply_bn(self, z, bn):
-        return bn(z)
+        if self.training:
+            mean, var = self._batch_stats(z)
+            self._update_running_stats(bn, mean, var)
+            return self._normalize_with_stats(z, mean, var)
+        return self._normalize_with_stats(z, bn.running_mean, bn.running_var)
 
     def _apply_cond_bn(self, z):
         is_uncond = z.abs().amax(dim=(1, 2), keepdim=True) < 1e-12
         valid_mask = ~is_uncond.view(-1)
         if valid_mask.any():
             if valid_mask.all():
-                z = self.cond_latent_bn(z)
+                z = self._apply_bn(z, self.cond_latent_bn)
             else:
                 out = z.clone()
-                out[valid_mask] = self.cond_latent_bn(z[valid_mask])
+                valid_z = z[valid_mask]
+                out[valid_mask] = self._apply_bn(valid_z, self.cond_latent_bn)
                 z = out
         return z.masked_fill(is_uncond, 0.0)
 
@@ -75,7 +100,7 @@ class Relat3DVAE(nn.Module):
         bn = self.cond_latent_bn if conditioning else self.latent_bn
         running_mean = bn.running_mean.view(1, -1, 1).to(device=z.device, dtype=z.dtype)
         running_var = bn.running_var.view(1, -1, 1).to(device=z.device, dtype=z.dtype)
-        return z * torch.sqrt(running_var + 1e-4) + running_mean
+        return z * torch.sqrt(running_var + self.bn_eps) + running_mean
 
     def forward_reconstruction(self, x):
         num_frames = x.size(2)
