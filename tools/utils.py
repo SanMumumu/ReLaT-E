@@ -135,6 +135,18 @@ def setup_distibuted_training(args, rank):
                                                  timeout=timedelta(seconds=10000))
 
 
+def resolve_visible_gpu_count(requested_gpus=None):
+    if not torch.cuda.is_available():
+        return 0
+    visible_gpus = torch.cuda.device_count()
+    if requested_gpus is None:
+        return visible_gpus
+    requested_gpus = int(requested_gpus)
+    if requested_gpus <= 0:
+        return visible_gpus
+    return min(requested_gpus, visible_gpus)
+
+
 def setup_logger(args, rank):
     if rank == 0:
         fn = file_name(args)

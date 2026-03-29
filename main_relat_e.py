@@ -30,7 +30,7 @@ from tools.relat_e_utils import (
     warmup_teacher,
 )
 from tools.train_utils import init_multiprocessing, update_ema
-from tools.utils import set_random_seed, setup_distibuted_training
+from tools.utils import resolve_visible_gpu_count, set_random_seed, setup_distibuted_training
 
 
 def optimizer_step(loss, optimizers, scaler, parameter_groups, grad_clip):
@@ -451,6 +451,10 @@ if __name__ == "__main__":
         cfg.optim.save_memory = True
         if int(cfg.optim.teacher_chunk_size) <= 0:
             cfg.optim.teacher_chunk_size = 1
+    visible_gpu_count = resolve_visible_gpu_count()
+    if torch.cuda.is_available() and visible_gpu_count <= 0:
+        raise RuntimeError("CUDA is available but no visible GPUs were resolved.")
+    cfg.experiment.n_gpus = max(visible_gpu_count, 1) if torch.cuda.is_available() else 1
     if cfg.experiment.n_gpus > 1:
         torch.multiprocessing.spawn(run, args=(cfg, args.ckpt or None), nprocs=cfg.experiment.n_gpus)
     else:

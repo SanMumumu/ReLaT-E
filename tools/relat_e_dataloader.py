@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 
 from torch.utils.data import DataLoader
 
@@ -40,28 +41,30 @@ def get_relat_e_loaders(rank, args):
 
     testset = PairedVideoFramesDataset(rgb_root, depth_root, split="test", **common_kwargs)
 
-    train_sampler = InfiniteSampler(dataset=trainset, rank=rank, num_replicas=args.experiment.n_gpus, seed=args.experiment.seed)
+    world_size = max(int(args.experiment.n_gpus), 1)
+    per_rank_batch = max(1, math.ceil(int(args.data.batch_size) / world_size))
+
+    train_sampler = InfiniteSampler(dataset=trainset, rank=rank, num_replicas=world_size, seed=args.experiment.seed)
     trainloader = DataLoader(
         trainset,
         sampler=train_sampler,
-        batch_size=args.data.batch_size // max(args.experiment.n_gpus, 1),
+        batch_size=per_rank_batch,
         pin_memory=False,
         num_workers=args.data.num_workers,
     )
 
     if valset is not None:
-        val_sampler = InfiniteSampler(dataset=valset, rank=rank, num_replicas=args.experiment.n_gpus, seed=args.experiment.seed)
         validationloader = DataLoader(
             valset,
-            sampler=val_sampler,
-            batch_size=args.data.batch_size // max(args.experiment.n_gpus, 1),
+            batch_size=per_rank_batch,
             pin_memory=False,
             num_workers=args.data.num_workers,
+            shuffle=False,
         )
     else:
         validationloader = DataLoader(
             testset,
-            batch_size=args.data.batch_size // max(args.experiment.n_gpus, 1),
+            batch_size=per_rank_batch,
             pin_memory=False,
             num_workers=args.data.num_workers,
             shuffle=False,
@@ -69,7 +72,7 @@ def get_relat_e_loaders(rank, args):
 
     testloader = DataLoader(
         testset,
-        batch_size=args.data.batch_size // max(args.experiment.n_gpus, 1),
+        batch_size=per_rank_batch,
         pin_memory=False,
         num_workers=args.data.num_workers,
         shuffle=False,
