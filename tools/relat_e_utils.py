@@ -14,6 +14,13 @@ from tools.relat_e_batch import apply_condition_mask, condition_mask, sample_con
 from tools.utils import AverageMeter, Logger
 
 
+def _safe_torch_load(path, map_location="cpu", weights_only=True):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=weights_only)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def unwrap_model(model):
     return model.module if hasattr(model, "module") else model
 
@@ -97,7 +104,7 @@ def load_relat_e_checkpoint(
     map_location="cpu",
     use_ema=False,
 ):
-    ckpt = torch.load(path, map_location=map_location)
+    ckpt = _safe_torch_load(path, map_location=map_location, weights_only=True)
     if use_ema and "ema_vae_rgb" in ckpt:
         unwrap_model(rgb_vae).load_state_dict(ckpt["ema_vae_rgb"])
         unwrap_model(depth_vae).load_state_dict(ckpt["ema_vae_depth"])

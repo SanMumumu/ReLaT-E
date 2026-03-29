@@ -13,6 +13,13 @@ from tools.relat_e_scaling import MODEL_SCALE_PRESETS, apply_model_scale, infer_
 from tools.relat_e_utils import load_relat_e_checkpoint, run_relat_e_evaluation
 
 
+def _safe_torch_load(path, map_location="cpu", weights_only=True):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=weights_only)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/relat_e_rgbd.yaml")
@@ -26,7 +33,7 @@ def parse_args():
 def main():
     args = parse_args()
     cfg = OmegaConf.load(args.config)
-    ckpt_meta = torch.load(args.ckpt, map_location="cpu")
+    ckpt_meta = _safe_torch_load(args.ckpt, map_location="cpu", weights_only=True)
     generator_state = ckpt_meta.get("ema_generator", ckpt_meta["generator_model"])
     resolved_scale = args.model_scale or infer_model_scale_from_state_dict(generator_state)
     apply_model_scale(cfg, resolved_scale)

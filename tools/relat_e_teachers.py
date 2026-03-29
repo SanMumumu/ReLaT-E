@@ -10,6 +10,13 @@ import torch.nn.functional as F
 from torchvision.transforms import Normalize
 
 
+def _safe_torch_load(path, map_location="cpu", weights_only=True):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=weights_only)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def _ensure_repo_import(repo_root):
     if not repo_root:
         return
@@ -86,7 +93,7 @@ class VideoDepthAnythingTeacher(BaseTeacher):
 
         config = dict(self.MODEL_CONFIGS[encoder])
         self.model = module.VideoDepthAnything(**config, metric=metric)
-        state_dict = torch.load(checkpoint, map_location="cpu")
+        state_dict = _safe_torch_load(checkpoint, map_location="cpu", weights_only=True)
         self.model.load_state_dict(state_dict, strict=True)
         self.model.eval()
         self.encoder = encoder
