@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from models.vae.vae_3d import Conv3DAutoencoder
 
@@ -40,31 +41,17 @@ class Relat3DVAE(nn.Module):
             x = x.view(batch, self.frames, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4).contiguous()
         return x[:, :, :frames]
 
-    def _batch_stats(self, z):
-        mean = z.mean(dim=(0, 2))
-        var = z.var(dim=(0, 2), unbiased=False)
-        return mean, var
-
-    def _update_running_stats(self, bn, mean, var):
-        with torch.no_grad():
-            if bn.momentum is None:
-                bn.running_mean.copy_(mean)
-                bn.running_var.copy_(var)
-            else:
-                bn.running_mean.lerp_(mean, bn.momentum)
-                bn.running_var.lerp_(var, bn.momentum)
-
-    def _normalize_with_stats(self, z, mean, var):
-        mean = mean.view(1, -1, 1).to(device=z.device, dtype=z.dtype)
-        var = var.view(1, -1, 1).to(device=z.device, dtype=z.dtype)
-        return (z - mean) / torch.sqrt(var + self.bn_eps)
-
     def _apply_bn(self, z, bn):
-        if self.training:
-            mean, var = self._batch_stats(z)
-            self._update_running_stats(bn, mean, var)
-            return self._normalize_with_stats(z, mean, var)
-        return self._normalize_with_stats(z, bn.running_mean, bn.running_var)
+        return F.batch_norm(
+            z,
+            bn.running_mean.float(),
+            bn.running_var.float(),
+            weight=None,
+            bias=None,
+            training=False,
+            momentum=0.0,
+            eps=self.bn_eps,
+        )
 
     def _apply_cond_bn(self, z):
         is_uncond = z.abs().amax(dim=(1, 2), keepdim=True) < 1e-12

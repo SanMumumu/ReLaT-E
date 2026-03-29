@@ -325,7 +325,7 @@ def run(rank, cfg, ckpt_path=None):
                     noise_rgb=flow_tuple["noise_rgb"],
                     noise_depth=flow_tuple["noise_depth"],
                 )
-                generator_relation_outputs = generator(
+                generator_outputs = generator(
                     z_rgb_t=relation_flow_tuple["z_rgb_t"],
                     z_depth_t=relation_flow_tuple["z_depth_t"],
                     cond_rgb=rgb_cond_detached,
@@ -334,40 +334,15 @@ def run(rank, cfg, ckpt_path=None):
                     t_depth=relation_flow_tuple["scaled_t_depth"],
                     return_features=True,
                 )
-                generator_relation_rgb, _ = relation_loss(generator_relation_outputs["aligned_rgb"], rgb_future_teacher)
-                generator_relation_depth, _ = relation_loss(generator_relation_outputs["aligned_depth"], depth_future_teacher)
+                generator_relation_rgb, _ = relation_loss(generator_outputs["aligned_rgb"], rgb_future_teacher)
+                generator_relation_depth, _ = relation_loss(generator_outputs["aligned_depth"], depth_future_teacher)
                 generator_relation_total = cfg.loss.relation.weight * (generator_relation_rgb + generator_relation_depth)
-            if bool(cfg.optim.save_memory):
-                del flow_tuple
-
-            optimizer_step(
-                generator_relation_total,
-                optimizers=opt_generator,
-                scaler=scaler_generator,
-                parameter_groups=list(unwrap_model(generator).parameters()),
-                grad_clip=cfg.optim.grad_clip,
-            )
-            if bool(cfg.optim.save_memory):
-                del generator_relation_outputs
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-
-            opt_generator.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, enabled=amp_enabled):
-                flow_outputs = generator(
-                    z_rgb_t=relation_flow_tuple["z_rgb_t"],
-                    z_depth_t=relation_flow_tuple["z_depth_t"],
-                    cond_rgb=rgb_cond_detached,
-                    cond_depth=depth_cond_detached,
-                    t_rgb=relation_flow_tuple["scaled_t_rgb"],
-                    t_depth=relation_flow_tuple["scaled_t_depth"],
-                    return_features=False,
-                )
-                flow_total, flow_stats = flow.compute_loss(flow_outputs, relation_flow_tuple)
+                flow_total, flow_stats = flow.compute_loss(generator_outputs, relation_flow_tuple)
                 flow_total = cfg.loss.flow.weight * flow_total
+                generator_total = generator_relation_total + flow_total
 
             optimizer_step(
-                flow_total,
+                generator_total,
                 optimizers=opt_generator,
                 scaler=scaler_generator,
                 parameter_groups=list(unwrap_model(generator).parameters()),
@@ -376,7 +351,7 @@ def run(rank, cfg, ckpt_path=None):
             opt_generator.zero_grad(set_to_none=True)
             update_ema(ema_generator, unwrap_model(generator), decay=cfg.ema.decay)
             if bool(cfg.optim.save_memory):
-                del relation_flow_tuple, flow_outputs
+                del flow_tuple, relation_flow_tuple, generator_outputs
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
 
