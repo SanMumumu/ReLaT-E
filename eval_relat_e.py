@@ -7,7 +7,7 @@ from omegaconf import OmegaConf
 
 from losses.relat_flow import RelatEFlowMatching
 from models.fm.relat_mot import ReLaTMoT
-from models.vae.relat_autoencoder import RelatAutoencoder
+from models.vae.relat_autoencoder import Relat3DVAE
 from tools.relat_e_dataloader import get_relat_e_loaders
 from tools.relat_e_scaling import MODEL_SCALE_PRESETS, apply_model_scale, infer_model_scale_from_state_dict
 from tools.relat_e_utils import load_relat_e_checkpoint, run_relat_e_evaluation
@@ -36,8 +36,8 @@ def main():
     rgb_teacher_dim = generator_state["rgb_relation_head.net.2.weight"].shape[0]
     depth_teacher_dim = generator_state["depth_relation_head.net.2.weight"].shape[0]
 
-    rgb_vae = RelatAutoencoder(cfg.rgb_vae.embed_dim, cfg.rgb_vae, bn_momentum=cfg.rgb_vae.bn_momentum).to(device)
-    depth_vae = RelatAutoencoder(cfg.depth_vae.embed_dim, cfg.depth_vae, bn_momentum=cfg.depth_vae.bn_momentum).to(device)
+    rgb_vae = Relat3DVAE(cfg.rgb_vae.embed_dim, cfg.rgb_vae, bn_momentum=cfg.rgb_vae.bn_momentum).to(device)
+    depth_vae = Relat3DVAE(cfg.depth_vae.embed_dim, cfg.depth_vae, bn_momentum=cfg.depth_vae.bn_momentum).to(device)
     generator = ReLaTMoT(
         input_size=cfg.generator.mot.input_size,
         in_channels=cfg.generator.mot.in_channels,

@@ -31,6 +31,13 @@ python tools/relat_e_smoke.py --config configs/relat_e_rgbd.yaml
 
 The default ReLaT-E config uses a paired RGB-D batch contract, a dual-teacher registry, and a dedicated MoT-based generator path.
 
+The default teacher setup is:
+
+- RGB teacher: VideoMAEv2 ViT-Base distilled from the giant checkpoint, loaded from `./ckpts/VideoMAEv2/distill/vit_b_k710_dl_from_giant.pth`
+- Depth teacher: Video Depth Anything ViT-Base, loaded from `./external/Video-Depth-Anything/checkpoints/video_depth_anything_vitb.pth`
+
+Clone the official Video Depth Anything repository under `./external/Video-Depth-Anything` or update `teachers.depth.repo_root` in [configs/relat_e_rgbd.yaml](C:/Users/wangsen/OneDrive/Desktop/ReLaT-E/configs/relat_e_rgbd.yaml).
+
 If 24GB GPUs still run out of memory, enable `--save_memory` or set `optim.save_memory: true` in the config. This turns on block checkpointing in the MoT generator, chunks teacher feature extraction, and releases intermediate tensors earlier during the three training stages.
 
 Generator scaling presets are:

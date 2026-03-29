@@ -13,7 +13,7 @@ from losses.reconstruction import AutoencoderReconstructionLoss
 from losses.relational import RelationalAlignmentLoss
 from losses.relat_flow import RelatEFlowMatching
 from models.fm.relat_mot import ReLaTMoT
-from models.vae.relat_autoencoder import RelatAutoencoder
+from models.vae.relat_autoencoder import Relat3DVAE
 from tools.relat_e_dataloader import get_relat_e_loaders
 from tools.relat_e_scaling import MODEL_SCALE_PRESETS, apply_model_scale
 from tools.relat_e_teachers import create_teacher
@@ -109,8 +109,8 @@ def run(rank, cfg, ckpt_path=None):
     loader_cfg.data.clip_frames = int(cfg.data.cond_frames + max(cfg.data.pred_frames, cfg.eval.future_frames))
     train_loader, val_loader, _ = get_relat_e_loaders(rank, loader_cfg)
 
-    rgb_vae = RelatAutoencoder(cfg.rgb_vae.embed_dim, cfg.rgb_vae, bn_momentum=cfg.rgb_vae.bn_momentum).to(device)
-    depth_vae = RelatAutoencoder(cfg.depth_vae.embed_dim, cfg.depth_vae, bn_momentum=cfg.depth_vae.bn_momentum).to(device)
+    rgb_vae = Relat3DVAE(cfg.rgb_vae.embed_dim, cfg.rgb_vae, bn_momentum=cfg.rgb_vae.bn_momentum).to(device)
+    depth_vae = Relat3DVAE(cfg.depth_vae.embed_dim, cfg.depth_vae, bn_momentum=cfg.depth_vae.bn_momentum).to(device)
 
     rgb_teacher = create_teacher(cfg.teachers.rgb, device)
     depth_teacher = create_teacher(cfg.teachers.depth, device)

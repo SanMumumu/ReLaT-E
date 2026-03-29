@@ -19,6 +19,7 @@ data:
   max_size: null
 
 rgb_vae:
+  architecture: vit_3d_vae
   embed_dim: 4
   bn_momentum: 0.1
   channels: 192
@@ -31,6 +32,7 @@ rgb_vae:
   kl_weight: 1.0e-6
 
 depth_vae:
+  architecture: vit_3d_vae
   embed_dim: 4
   bn_momentum: 0.1
   channels: 192
@@ -62,17 +64,22 @@ generator:
 
 teachers:
   rgb:
-    name: patch_tokens
+    name: videomaev2_distill_base
     target_dim: 768
-    patch_size: 16
+    checkpoint: ./ckpts/VideoMAEv2/distill/vit_b_k710_dl_from_giant.pth
+    input_size: 224
+    num_frames: 8
     normalize: imagenet
-    ckpt_dir: ./ckpts
+    target_resolution: [224, 224]
   depth:
-    name: patch_tokens
-    target_dim: 768
-    patch_size: 16
-    normalize: depth
-    ckpt_dir: ./ckpts
+    name: video_depth_anything
+    repo_root: ./external/Video-Depth-Anything
+    checkpoint: ./external/Video-Depth-Anything/checkpoints/video_depth_anything_vitb.pth
+    encoder: vitb
+    input_size: 518
+    metric: false
+    feature_source: path3
+    target_dim: 128
 
 loss:
   flow:

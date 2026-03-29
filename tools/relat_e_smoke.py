@@ -8,7 +8,7 @@ from omegaconf import OmegaConf
 from losses.relational import RelationalAlignmentLoss
 from losses.relat_flow import RelatEFlowMatching
 from models.fm.relat_mot import ReLaTMoT
-from models.vae.relat_autoencoder import RelatAutoencoder
+from models.vae.relat_autoencoder import Relat3DVAE
 from tools.relat_e_batch import condition_mask
 from tools.relat_e_scaling import MODEL_SCALE_PRESETS, apply_model_scale
 from tools.relat_e_teachers import create_teacher
@@ -34,8 +34,8 @@ def main():
     batch = 2
     total_frames = cfg.data.cond_frames + cfg.data.pred_frames
 
-    rgb_vae = RelatAutoencoder(cfg.rgb_vae.embed_dim, cfg.rgb_vae, bn_momentum=cfg.rgb_vae.bn_momentum).to(device)
-    depth_vae = RelatAutoencoder(cfg.depth_vae.embed_dim, cfg.depth_vae, bn_momentum=cfg.depth_vae.bn_momentum).to(device)
+    rgb_vae = Relat3DVAE(cfg.rgb_vae.embed_dim, cfg.rgb_vae, bn_momentum=cfg.rgb_vae.bn_momentum).to(device)
+    depth_vae = Relat3DVAE(cfg.depth_vae.embed_dim, cfg.depth_vae, bn_momentum=cfg.depth_vae.bn_momentum).to(device)
     rgb_teacher = create_teacher(cfg.teachers.rgb, device)
     depth_teacher = create_teacher(cfg.teachers.depth, device)
 

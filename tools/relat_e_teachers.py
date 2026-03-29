@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-import os
+import importlib
+import sys
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -8,7 +10,15 @@ import torch.nn.functional as F
 from torchvision.transforms import Normalize
 
 
-class BaseTokenTeacher(nn.Module):
+def _ensure_repo_import(repo_root):
+    if not repo_root:
+        return
+    repo_path = str(Path(repo_root).expanduser().resolve())
+    if repo_path not in sys.path:
+        sys.path.insert(0, repo_path)
+
+
+class BaseTeacher(nn.Module):
     output_dim = None
 
     def extract(self, video):
@@ -18,113 +28,166 @@ class BaseTokenTeacher(nn.Module):
         return self.extract(video)
 
 
-class PatchTokenTeacher(BaseTokenTeacher):
-    def __init__(self, patch_size=16, normalize="imagenet"):
+class VideoMAEv2RGBTeacher(BaseTeacher):
+    def __init__(self, checkpoint, input_size=224, num_frames=8, target_resolution=None, normalize="imagenet"):
         super().__init__()
-        self.patch_size = int(patch_size)
+        from models.ssl.videomaev2 import vit_base_patch16_224
+
+        target_resolution = target_resolution or [input_size, input_size]
+        self.model = vit_base_patch16_224(
+            img_size=input_size,
+            align_video_resolution=tuple(target_resolution),
+            all_frames=num_frames,
+        )
+        self.model.from_pretrained(checkpoint)
+        self.model.eval()
+        self.output_dim = int(self.model.embed_dim)
+        self.input_size = int(input_size)
+        self.num_frames = int(num_frames)
         self.normalize = normalize
-        self._normalizers = {
-            "imagenet": Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        }
-        self.output_dim = None
-
-    def _normalize_video(self, video):
-        if self.normalize == "depth":
-            flat = video.transpose(1, 2).flatten(0, 1)
-            mean = flat.mean(dim=(2, 3), keepdim=True)
-            std = flat.std(dim=(2, 3), keepdim=True, unbiased=False).clamp_min(1e-6)
-            flat = (flat - mean) / std
-            return flat
-        if self.normalize in self._normalizers:
-            flat = ((video + 1.0) / 2.0).transpose(1, 2).flatten(0, 1)
-            return self._normalizers[self.normalize](flat)
-        return video.transpose(1, 2).flatten(0, 1)
-
-    def extract(self, video):
-        b, c, t, h, w = video.shape
-        frames = self._normalize_video(video)
-        target_h = max(self.patch_size, h - (h % self.patch_size))
-        target_w = max(self.patch_size, w - (w % self.patch_size))
-        if target_h != h or target_w != w:
-            frames = F.interpolate(frames, size=(target_h, target_w), mode="bilinear", align_corners=False)
-        patches = F.unfold(frames, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
-        self.output_dim = patches.size(-1)
-        return patches.reshape(b, t * patches.size(1), patches.size(-1))
-
-
-class WrappedVideoTeacher(BaseTokenTeacher):
-    def __init__(self, model, model_name):
-        super().__init__()
-        self.model = model.eval()
-        self.model_name = model_name
-        self.output_dim = getattr(model, "embed_dim", None)
+        self._imagenet_norm = Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         for param in self.model.parameters():
             param.requires_grad = False
 
+    def _prepare(self, video):
+        b, c, t, _, _ = video.shape
+        if c != 3:
+            raise ValueError(f"VideoMAEv2 RGB teacher expects 3 channels, got {c}.")
+        frames = ((video + 1.0) / 2.0).clamp(0.0, 1.0).transpose(1, 2).flatten(0, 1)
+        frames = F.interpolate(frames, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False)
+        if self.normalize == "imagenet":
+            frames = self._imagenet_norm(frames)
+        return frames.reshape(b, t, frames.size(1), self.input_size, self.input_size).transpose(1, 2).contiguous()
+
     def extract(self, video):
-        b, _, f, _, _ = video.shape
-        frames_01 = (video + 1.0) / 2.0
-        flat = frames_01.transpose(1, 2).flatten(0, 1)
-        flat = Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])(flat)
-        prepared = flat.reshape(b, f, flat.size(1), flat.size(2), flat.size(3)).transpose(1, 2)
         with torch.no_grad():
-            if self.model_name in {"VideoMAEv2", "VideoMAE", "OminiMAE", "VJEPA", "VJEPA2"}:
-                features = self.model(prepared)
-            elif self.model_name in {"DINOv3"}:
-                frames_2d = prepared.transpose(1, 2).flatten(0, 1)
-                out = self.model.forward_features(frames_2d)
-                tokens = out["x_norm_patchtokens"]
-                features = tokens.reshape(b, f * tokens.size(1), tokens.size(2))
-            else:
-                raise NotImplementedError(f"Unsupported wrapped teacher: {self.model_name}")
-        if self.output_dim is None:
-            self.output_dim = features.size(-1)
-        return features
+            return self.model(self._prepare(video))
 
 
-def _load_rgb_backbone(name, ckpt_dir, device):
-    if name == "VideoMAEv2":
-        from models.ssl.videomaev2 import vit_base_patch16_224
+class VideoDepthAnythingTeacher(BaseTeacher):
+    MODEL_CONFIGS = {
+        "vits": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]},
+        "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96, 192, 384, 768]},
+        "vitl": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
+    }
 
-        model = vit_base_patch16_224().to(device)
-        model.from_pretrained(os.path.join(ckpt_dir, "VideoMAEv2/vit_b_k710_dl_from_giant.pth"))
-        return model
-    if name == "VideoMAE":
-        from models.ssl.videomae import vit_base_patch16_224
+    def __init__(self, repo_root, checkpoint, encoder="vitb", input_size=518, metric=False, feature_source="path3"):
+        super().__init__()
+        if encoder not in self.MODEL_CONFIGS:
+            raise ValueError(f"Unsupported Video Depth Anything encoder: {encoder}")
+        _ensure_repo_import(repo_root)
+        try:
+            module = importlib.import_module("video_depth_anything.video_depth")
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "Video Depth Anything is not importable. Set teachers.depth.repo_root to the cloned "
+                "DepthAnything/Video-Depth-Anything repository."
+            ) from exc
 
-        model = vit_base_patch16_224().to(device)
-        model.from_pretrained(
-            os.path.join(ckpt_dir, "VideoMAE/k400_videomae_pretrain_base_patch16_224_frame_16x4_tube_mask_ratio_0_9_e1600.pth")
+        config = dict(self.MODEL_CONFIGS[encoder])
+        self.model = module.VideoDepthAnything(**config, metric=metric)
+        state_dict = torch.load(checkpoint, map_location="cpu")
+        self.model.load_state_dict(state_dict, strict=True)
+        self.model.eval()
+        self.encoder = encoder
+        self.input_size = int(round(input_size / 14) * 14)
+        self.feature_source = feature_source
+        self.output_dim = int(config["features"]) if feature_source != "prediction" else 1
+        self._imagenet_norm = Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+    def _prepare(self, video):
+        b, c, t, _, _ = video.shape
+        frames = ((video + 1.0) / 2.0).clamp(0.0, 1.0).transpose(1, 2).flatten(0, 1)
+        if c == 1:
+            frames = frames.repeat(1, 3, 1, 1)
+        elif c > 3:
+            frames = frames[:, :3]
+        frames = F.interpolate(frames, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False)
+        frames = self._imagenet_norm(frames)
+        return frames.reshape(b, t, frames.size(1), self.input_size, self.input_size).contiguous()
+
+    def _extract_prediction_tokens(self, frames):
+        depth = self.model(frames)
+        tokens = depth.reshape(depth.size(0), depth.size(1), -1, 1)
+        return tokens.reshape(depth.size(0), depth.size(1) * tokens.size(2), 1)
+
+    def _extract_path3_tokens(self, frames):
+        b, t, _, h, w = frames.shape
+        patch_h, patch_w = h // 14, w // 14
+        out_features = self.model.pretrained.get_intermediate_layers(
+            frames.flatten(0, 1),
+            self.model.intermediate_layer_idx[self.model.encoder],
+            return_class_token=True,
         )
-        return model
-    if name == "OminiMAE":
-        from models.ssl.omini_mae import vit_base_mae_pretraining
+        head = self.model.head
+        out = []
+        for index, feat in enumerate(out_features):
+            if head.use_clstoken:
+                tokens, cls_token = feat[0], feat[1]
+                readout = cls_token.unsqueeze(1).expand_as(tokens)
+                tokens = head.readout_projects[index](torch.cat((tokens, readout), dim=-1))
+            else:
+                tokens = feat[0]
+            tokens = tokens.permute(0, 2, 1).reshape(tokens.shape[0], tokens.shape[-1], patch_h, patch_w).contiguous()
+            tokens = head.projects[index](tokens)
+            tokens = head.resize_layers[index](tokens)
+            out.append(tokens)
 
-        return vit_base_mae_pretraining().to(device)
-    if name == "VJEPA":
-        from models.ssl.JEPA import load_VJEPA
+        layer_1, layer_2, layer_3, layer_4 = out
+        layer_3, _ = head.motion_modules[0](layer_3.unflatten(0, (b, t)).permute(0, 2, 1, 3, 4), None, None, None)
+        layer_3 = layer_3.permute(0, 2, 1, 3, 4).flatten(0, 1)
+        layer_4, _ = head.motion_modules[1](layer_4.unflatten(0, (b, t)).permute(0, 2, 1, 3, 4), None, None, None)
+        layer_4 = layer_4.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
-        return load_VJEPA(device=device, pretrained_path=os.path.join(ckpt_dir, "vjepa_l/vitl16.pth.tar"))
-    if name == "VJEPA2":
-        model, _ = torch.hub.load("facebookresearch/vjepa2", "vjepa2_vit_large")
-        if hasattr(model, "norm"):
-            model.norm = nn.Identity()
-        return model.to(device)
-    if name == "DINOv3":
-        model = torch.hub.load("facebookresearch/dinov3", "dinov3_vits16").to(device)
-        if hasattr(model, "head"):
-            model.head = nn.Identity()
-        return model
-    raise NotImplementedError(f"Unsupported teacher backbone: {name}")
+        layer_1_rn = head.scratch.layer1_rn(layer_1)
+        layer_2_rn = head.scratch.layer2_rn(layer_2)
+        layer_3_rn = head.scratch.layer3_rn(layer_3)
+        layer_4_rn = head.scratch.layer4_rn(layer_4)
+
+        path_4 = head.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
+        path_4, _ = head.motion_modules[2](path_4.unflatten(0, (b, t)).permute(0, 2, 1, 3, 4), None, None, None)
+        path_4 = path_4.permute(0, 2, 1, 3, 4).flatten(0, 1)
+        path_3 = head.scratch.refinenet3(path_4, layer_3_rn, size=layer_2_rn.shape[2:])
+        path_3, _ = head.motion_modules[3](path_3.unflatten(0, (b, t)).permute(0, 2, 1, 3, 4), None, None, None)
+        path_3 = path_3.permute(0, 2, 1, 3, 4).flatten(0, 1)
+
+        channels = path_3.size(1)
+        tokens = path_3.reshape(b, t, channels, -1).permute(0, 1, 3, 2).contiguous()
+        return tokens.reshape(b, t * tokens.size(2), channels)
+
+    def extract(self, video):
+        frames = self._prepare(video)
+        with torch.no_grad():
+            if self.feature_source == "prediction":
+                return self._extract_prediction_tokens(frames)
+            if self.feature_source == "path3":
+                return self._extract_path3_tokens(frames)
+            raise ValueError(f"Unsupported Video Depth Anything feature source: {self.feature_source}")
 
 
 def create_teacher(cfg, device):
-    name = cfg.name
-    if name == "patch_tokens":
-        teacher = PatchTokenTeacher(patch_size=cfg.patch_size, normalize=cfg.normalize)
+    name = str(cfg.name).lower()
+    if name in {"videomaev2_distill_base", "videomaev2_rgb"}:
+        teacher = VideoMAEv2RGBTeacher(
+            checkpoint=cfg.checkpoint,
+            input_size=int(getattr(cfg, "input_size", 224)),
+            num_frames=int(getattr(cfg, "num_frames", 8)),
+            target_resolution=getattr(cfg, "target_resolution", None),
+            normalize=str(getattr(cfg, "normalize", "imagenet")),
+        )
+    elif name in {"video_depth_anything", "videodepthanything"}:
+        teacher = VideoDepthAnythingTeacher(
+            repo_root=str(getattr(cfg, "repo_root", "")),
+            checkpoint=cfg.checkpoint,
+            encoder=str(getattr(cfg, "encoder", "vitb")),
+            input_size=int(getattr(cfg, "input_size", 518)),
+            metric=bool(getattr(cfg, "metric", False)),
+            feature_source=str(getattr(cfg, "feature_source", "path3")),
+        )
     else:
-        model = _load_rgb_backbone(name, cfg.ckpt_dir, device)
-        teacher = WrappedVideoTeacher(model, name)
+        raise NotImplementedError(f"Unsupported teacher backbone: {cfg.name}")
     teacher = teacher.to(device)
     teacher.eval()
     for param in teacher.parameters():

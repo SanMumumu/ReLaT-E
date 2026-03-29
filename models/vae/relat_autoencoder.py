@@ -6,9 +6,12 @@ import torch.nn as nn
 from models.vae.vae_vit_rope import ViTAutoencoder
 
 
-class RelatAutoencoder(nn.Module):
+class Relat3DVAE(nn.Module):
     def __init__(self, embed_dim, vaeconfig, bn_momentum=0.1):
         super().__init__()
+        architecture = str(getattr(vaeconfig, "architecture", vaeconfig.get("architecture", "vit_3d_vae")))
+        if architecture != "vit_3d_vae":
+            raise ValueError(f"Unsupported VAE architecture for ReLaT-E: {architecture}")
         self.model = ViTAutoencoder(embed_dim, vaeconfig)
         self.frames = int(vaeconfig["frames"])
         self.latent_bn = nn.BatchNorm1d(embed_dim, eps=1e-4, momentum=bn_momentum, affine=False, track_running_stats=True)
@@ -99,3 +102,6 @@ class RelatAutoencoder(nn.Module):
                 raise ValueError("Latent tensor z is required for decode mode.")
             return self.decode(z, num_frames=num_frames, conditioning=conditioning)
         raise ValueError(f"Unsupported forward mode: {mode}")
+
+
+RelatAutoencoder = Relat3DVAE
