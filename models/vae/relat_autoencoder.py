@@ -47,16 +47,8 @@ class Relat3DVAE(nn.Module):
 
     def _apply_cond_bn(self, z):
         is_uncond = z.abs().amax(dim=(1, 2), keepdim=True) < 1e-12
-        valid_mask = ~is_uncond.view(-1)
-        if valid_mask.any():
-            if valid_mask.all():
-                z = self._apply_bn(z, self.cond_latent_bn)
-            else:
-                out = z.clone()
-                valid_z = z[valid_mask]
-                out[valid_mask] = self._apply_bn(valid_z, self.cond_latent_bn)
-                z = out
-        return z.masked_fill(is_uncond, 0.0)
+        normalized = self._apply_bn(z, self.cond_latent_bn)
+        return torch.where(is_uncond, torch.zeros_like(normalized), normalized)
 
     def encode_future(self, x, normalize=True):
         z = self.extract_latent(x)

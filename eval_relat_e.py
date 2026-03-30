@@ -81,7 +81,19 @@ def main():
     def log_(message):
         print(message)
 
-    run_relat_e_evaluation(val_loader, rgb_vae, depth_vae, generator, flow, cfg, device, step=0, logger=None, log_=log_)
+    run_relat_e_evaluation(
+        val_loader,
+        rgb_vae,
+        depth_vae,
+        generator,
+        flow,
+        cfg,
+        device,
+        step=0,
+        logger=None,
+        log_=log_,
+        rollout=True,
+    )
 
 
 if __name__ == "__main__":

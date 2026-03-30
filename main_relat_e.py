@@ -67,18 +67,18 @@ def extract_teacher_tokens(teacher, video, chunk_size):
 
 
 def compute_vae_branch(vae, recon_loss_fn, past, future, save_memory):
-    past_recon, past_kl, _ = vae(x=past, mode="reconstruct")
+    past_recon, past_kl, past_latent = vae(x=past, mode="reconstruct")
     past_total, past_stats = recon_loss_fn(past, past_recon, past_kl)
     if save_memory:
         del past_recon
 
-    future_recon, future_kl, _ = vae(x=future, mode="reconstruct")
+    future_recon, future_kl, future_latent = vae(x=future, mode="reconstruct")
     future_total, future_stats = recon_loss_fn(future, future_recon, future_kl)
     if save_memory:
         del future_recon
 
-    cond_latent = vae(x=past, mode="extract", normalize=True, conditioning=True)
-    future_latent = vae(x=future, mode="extract", normalize=True, conditioning=False)
+    cond_latent = vae.normalize_latent(past_latent, conditioning=True)
+    future_latent = vae.normalize_latent(future_latent, conditioning=False)
     total = past_total + future_total
     stats = {
         "mse": 0.5 * (past_stats["mse"] + future_stats["mse"]),
@@ -402,8 +402,20 @@ def run(rank, cfg, ckpt_path=None):
                     logger.scalar_summary(key, meter.average, global_step)
                 meters = init_metric_meters()
 
-            if rank == 0 and global_step % int(cfg.optim.eval_freq) == 0:
-                run_relat_e_evaluation(val_loader, ema_rgb_vae, ema_depth_vae, ema_generator, flow, cfg, device, global_step, logger, log_)
+        if rank == 0 and global_step % int(cfg.optim.eval_freq) == 0:
+            run_relat_e_evaluation(
+                val_loader,
+                ema_rgb_vae,
+                ema_depth_vae,
+                ema_generator,
+                flow,
+                cfg,
+                device,
+                global_step,
+                logger,
+                log_,
+                rollout=False,
+            )
 
             if rank == 0 and global_step % int(cfg.optim.save_freq) == 0:
                 ckpt_dir = logger.logdir if logger is not None else cfg.experiment.output

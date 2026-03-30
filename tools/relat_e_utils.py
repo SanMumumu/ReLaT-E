@@ -205,9 +205,11 @@ def _fvd(reals, preds, i3d, device):
     return value.item() if isinstance(value, torch.Tensor) else float(value)
 
 
-def collect_metrics(reals, preds, device, use_lpips=True, use_fvd=True):
+def collect_metrics(reals, preds, device, use_lpips=True, use_fvd=True, fvd_reals=None, fvd_preds=None):
     reals_01 = ((reals + 1.0) / 2.0).clamp(0.0, 1.0)
     preds_01 = ((preds + 1.0) / 2.0).clamp(0.0, 1.0)
+    fvd_reals_01 = reals_01 if fvd_reals is None else ((fvd_reals + 1.0) / 2.0).clamp(0.0, 1.0)
+    fvd_preds_01 = preds_01 if fvd_preds is None else ((fvd_preds + 1.0) / 2.0).clamp(0.0, 1.0)
     lpips_model = None
     i3d = None
     if use_lpips and reals.size(1) == 3:
@@ -223,7 +225,41 @@ def collect_metrics(reals, preds, device, use_lpips=True, use_fvd=True):
         "psnr": _psnr(reals_01, preds_01),
         "ssim": _ssim(reals_01, preds_01),
         "lpips": _lpips(reals_01.to(device), preds_01.to(device), lpips_model),
-        "fvd": _fvd(reals_01, preds_01, i3d, device),
+        "fvd": _fvd(fvd_reals_01, fvd_preds_01, i3d, device),
+    }
+
+@torch.no_grad()
+def predict_future_once(batch, rgb_vae, depth_vae, generator, flow, cfg, device, condition_mode="full", future_frames=None):
+    future_frames = cfg.data.pred_frames if future_frames is None else future_frames
+    cond_frames = int(cfg.data.cond_frames)
+    pred_frames = int(cfg.data.pred_frames)
+    prepared = prepare_relat_e_batch(batch, cfg, device, mode=condition_mode, future_frames=future_frames)
+    generator = unwrap_model(generator)
+    rgb_vae = unwrap_model(rgb_vae)
+    depth_vae = unwrap_model(depth_vae)
+    rgb_context = prepared["rgb_past"]
+    depth_context = prepared["depth_past"]
+    rgb_cond = rgb_vae.encode_past(rgb_context[:, :, -cond_frames:], normalize=True)
+    depth_cond = depth_vae.encode_past(depth_context[:, :, -cond_frames:], normalize=True)
+    rgb_cond, depth_cond = build_condition_latents(rgb_cond, depth_cond, prepared["modality_mask"])
+    latent_shape = (unwrap_model(generator).in_channels, unwrap_model(generator).ae_emb_dim)
+    z_rgb, z_depth = flow.sample(
+        generator=generator,
+        batch_size=rgb_context.size(0),
+        latent_shape=latent_shape,
+        cond_rgb=rgb_cond,
+        cond_depth=depth_cond,
+        guidance_scale=cfg.eval.cfg_scale,
+    )
+    rgb_pred = rgb_vae.decode(z_rgb, num_frames=pred_frames)[:, :, :future_frames]
+    depth_pred = depth_vae.decode(z_depth, num_frames=pred_frames)[:, :, :future_frames]
+    return {
+        "rgb_context": rgb_context,
+        "depth_context": depth_context,
+        "rgb_real": prepared["rgb_future"][:, :, :future_frames],
+        "depth_real": prepared["depth_future"][:, :, :future_frames],
+        "rgb_pred": rgb_pred,
+        "depth_pred": depth_pred,
     }
 
 
@@ -262,6 +298,8 @@ def rollout_future(batch, rgb_vae, depth_vae, generator, flow, cfg, device, cond
     rgb_pred = torch.cat(rgb_preds, dim=2)[:, :, :future_frames]
     depth_pred = torch.cat(depth_preds, dim=2)[:, :, :future_frames]
     return {
+        "rgb_context": prepared["rgb_past"],
+        "depth_context": prepared["depth_past"],
         "rgb_real": prepared["rgb_future"][:, :, :future_frames],
         "depth_real": prepared["depth_future"][:, :, :future_frames],
         "rgb_pred": rgb_pred,
@@ -270,28 +308,48 @@ def rollout_future(batch, rgb_vae, depth_vae, generator, flow, cfg, device, cond
 
 
 @torch.no_grad()
-def run_relat_e_evaluation(val_loader, rgb_vae, depth_vae, generator, flow, cfg, device, step, logger, log_):
+def run_relat_e_evaluation(val_loader, rgb_vae, depth_vae, generator, flow, cfg, device, step, logger, log_, rollout=False):
     max_samples = int(cfg.eval.eval_samples)
     rgb_reals, rgb_preds = [], []
     depth_reals, depth_preds = [], []
+    rgb_fvd_reals, rgb_fvd_preds = [], []
+    depth_fvd_reals, depth_fvd_preds = [], []
     seen = 0
     for batch in val_loader:
-        rollout = rollout_future(
-            batch,
-            rgb_vae,
-            depth_vae,
-            generator,
-            flow,
-            cfg,
-            device,
-            condition_mode="full",
-            future_frames=cfg.eval.future_frames,
+        outputs = (
+            rollout_future(
+                batch,
+                rgb_vae,
+                depth_vae,
+                generator,
+                flow,
+                cfg,
+                device,
+                condition_mode="full",
+                future_frames=cfg.eval.future_frames,
+            )
+            if rollout
+            else predict_future_once(
+                batch,
+                rgb_vae,
+                depth_vae,
+                generator,
+                flow,
+                cfg,
+                device,
+                condition_mode="full",
+                future_frames=cfg.data.pred_frames,
+            )
         )
-        rgb_reals.append(rollout["rgb_real"].cpu())
-        rgb_preds.append(rollout["rgb_pred"].cpu())
-        depth_reals.append(rollout["depth_real"].cpu())
-        depth_preds.append(rollout["depth_pred"].cpu())
-        seen += rollout["rgb_real"].size(0)
+        rgb_reals.append(outputs["rgb_real"].cpu())
+        rgb_preds.append(outputs["rgb_pred"].cpu())
+        depth_reals.append(outputs["depth_real"].cpu())
+        depth_preds.append(outputs["depth_pred"].cpu())
+        rgb_fvd_reals.append(torch.cat([outputs["rgb_context"], outputs["rgb_real"]], dim=2).cpu())
+        rgb_fvd_preds.append(torch.cat([outputs["rgb_context"], outputs["rgb_pred"]], dim=2).cpu())
+        depth_fvd_reals.append(torch.cat([outputs["depth_context"], outputs["depth_real"]], dim=2).cpu())
+        depth_fvd_preds.append(torch.cat([outputs["depth_context"], outputs["depth_pred"]], dim=2).cpu())
+        seen += outputs["rgb_real"].size(0)
         if seen >= max_samples:
             break
 
@@ -301,9 +359,20 @@ def run_relat_e_evaluation(val_loader, rgb_vae, depth_vae, generator, flow, cfg,
     rgb_pred = torch.cat(rgb_preds, dim=0)[:max_samples]
     depth_real = torch.cat(depth_reals, dim=0)[:max_samples]
     depth_pred = torch.cat(depth_preds, dim=0)[:max_samples]
+    rgb_fvd_real = torch.cat(rgb_fvd_reals, dim=0)[:max_samples]
+    rgb_fvd_pred = torch.cat(rgb_fvd_preds, dim=0)[:max_samples]
+    depth_fvd_real = torch.cat(depth_fvd_reals, dim=0)[:max_samples]
+    depth_fvd_pred = torch.cat(depth_fvd_preds, dim=0)[:max_samples]
 
-    rgb_metrics = collect_metrics(rgb_real, rgb_pred, device)
-    depth_metrics = collect_metrics(depth_real, depth_pred, device, use_lpips=(depth_real.size(1) == 3))
+    rgb_metrics = collect_metrics(rgb_real, rgb_pred, device, fvd_reals=rgb_fvd_real, fvd_preds=rgb_fvd_pred)
+    depth_metrics = collect_metrics(
+        depth_real,
+        depth_pred,
+        device,
+        use_lpips=(depth_real.size(1) == 3),
+        fvd_reals=depth_fvd_real,
+        fvd_preds=depth_fvd_pred,
+    )
     log_(f"[Eval RGB step {step}] PSNR: {rgb_metrics['psnr']:.4f} | SSIM: {rgb_metrics['ssim']:.4f} | LPIPS: {rgb_metrics['lpips']:.4f} | FVD: {rgb_metrics['fvd']:.4f}")
     log_(f"[Eval Depth step {step}] PSNR: {depth_metrics['psnr']:.4f} | SSIM: {depth_metrics['ssim']:.4f} | LPIPS: {depth_metrics['lpips']:.4f} | FVD: {depth_metrics['fvd']:.4f}")
     if logger is not None:
