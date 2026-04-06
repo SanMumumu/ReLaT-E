@@ -7,7 +7,7 @@ from omegaconf import OmegaConf
 
 from losses.relational import RelationalAlignmentLoss
 from losses.relat_flow import RelatEFlowMatching
-from models.fm.relat_mot import ReLaTMoT
+from models.fm.relat_mot import ReLaTMoT, SharedMoTBlock
 from models.vae.relat_autoencoder import Relat3DVAE
 from tools.relat_e_batch import condition_mask
 from tools.relat_e_scaling import MODEL_SCALE_PRESETS, apply_model_scale
@@ -22,6 +22,31 @@ def grad_norm(parameters):
     return total
 
 
+def check_shared_mot_block(device):
+    block = SharedMoTBlock(
+        hidden_size=32,
+        num_heads=4,
+        use_qknorm=True,
+        use_swiglu=True,
+        use_rmsnorm=True,
+        wo_shift=True,
+        fused_attn=True,
+    ).to(device)
+    rgb = torch.randn(2, 5, 32, device=device, requires_grad=True)
+    depth = torch.randn(2, 7, 32, device=device, requires_grad=True)
+    t_rgb = torch.randn(2, 32, device=device)
+    t_depth = torch.randn(2, 32, device=device) + 1.0
+
+    out_rgb, out_depth = block(rgb, depth, t_rgb, t_depth)
+    assert out_rgb.shape == rgb.shape
+    assert out_depth.shape == depth.shape
+    (out_rgb.square().mean() + out_depth.square().mean()).backward()
+    if block.rgb_block.adaLN_modulation[-1].weight.grad is None:
+        raise RuntimeError("RGB shared MoT branch did not receive AdaLN gradients.")
+    if block.depth_block.adaLN_modulation[-1].weight.grad is None:
+        raise RuntimeError("Depth shared MoT branch did not receive AdaLN gradients.")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/relat_e_rgbd.yaml")
@@ -31,6 +56,7 @@ def main():
     apply_model_scale(cfg, args.model_scale or None)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    check_shared_mot_block(device)
     batch = 2
     total_frames = cfg.data.cond_frames + cfg.data.pred_frames
 
@@ -77,7 +103,7 @@ def main():
     flow = RelatEFlowMatching(
         sampling_timesteps=cfg.loss.flow.sampling_timesteps,
         sigma_min=cfg.loss.flow.sigma_min,
-        same_noise=cfg.generator.mot.same_noise,
+        same_noise=False,
     ).to(device)
 
     rgb_past = rgb_sample[:, :, :cfg.data.cond_frames]
@@ -94,7 +120,15 @@ def main():
 
     teacher_rgb = rgb_teacher.extract(rgb_future)
     teacher_depth = depth_teacher.extract(depth_future)
-    flow_tuple = flow.sample_training_tuple(rgb_future_latent, depth_future_latent)
+    async_t_rgb = torch.linspace(0.2, 0.8, steps=batch, device=device, dtype=rgb_future_latent.dtype)
+    async_t_depth = torch.linspace(0.8, 0.2, steps=batch, device=device, dtype=depth_future_latent.dtype)
+    flow_tuple = flow.sample_training_tuple(
+        rgb_future_latent,
+        depth_future_latent,
+        t_rgb=async_t_rgb,
+        t_depth=async_t_depth,
+        same_noise=False,
+    )
 
     for module in (rgb_vae, depth_vae, generator):
         module.zero_grad(set_to_none=True)
@@ -128,6 +162,20 @@ def main():
     flow_vae_grad = grad_norm(list(rgb_vae.parameters()) + list(depth_vae.parameters()))
     flow_gen_grad = grad_norm(generator.parameters())
 
+    with torch.no_grad():
+        sample_v_rgb, sample_v_depth = generator.forward_sampling(
+            flow_tuple["z_rgb_t"].detach(),
+            flow_tuple["z_depth_t"].detach(),
+            rgb_cond.detach(),
+            depth_cond.detach(),
+            flow_tuple["scaled_t_rgb"],
+            flow_tuple["scaled_t_depth"],
+        )
+    if sample_v_rgb.shape != flow_tuple["target_rgb"].shape:
+        raise RuntimeError(f"RGB sampling shape mismatch: {sample_v_rgb.shape} != {flow_tuple['target_rgb'].shape}")
+    if sample_v_depth.shape != flow_tuple["target_depth"].shape:
+        raise RuntimeError(f"Depth sampling shape mismatch: {sample_v_depth.shape} != {flow_tuple['target_depth'].shape}")
+
     print(
         {
             "relation_vae_grad": relation_vae_grad,
@@ -136,6 +184,8 @@ def main():
             "flow_gen_grad": flow_gen_grad,
             "rgb_hidden_shape": tuple(relation_outputs["aligned_rgb"].shape),
             "depth_hidden_shape": tuple(relation_outputs["aligned_depth"].shape),
+            "sampling_rgb_shape": tuple(sample_v_rgb.shape),
+            "sampling_depth_shape": tuple(sample_v_depth.shape),
         }
     )
 

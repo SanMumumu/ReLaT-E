@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import warnings
+from collections import OrderedDict
 from datetime import datetime
 
 import numpy as np
@@ -23,6 +25,28 @@ def _safe_torch_load(path, map_location="cpu", weights_only=True):
 
 def unwrap_model(model):
     return model.module if hasattr(model, "module") else model
+
+
+def _migrate_relat_mot_generator_state_dict(state_dict):
+    prefix = "shared_stream.blocks."
+    branch_prefixes = ("rgb_block.", "depth_block.")
+    migrated = OrderedDict()
+    changed = False
+
+    for key, value in state_dict.items():
+        if key.startswith(prefix):
+            block_suffix = key[len(prefix):]
+            block_index, sep, branch_key = block_suffix.partition(".")
+            if sep and not branch_key.startswith(branch_prefixes):
+                migrated[f"{prefix}{block_index}.rgb_block.{branch_key}"] = value
+                migrated[f"{prefix}{block_index}.depth_block.{branch_key}"] = value
+                changed = True
+                continue
+        migrated[key] = value
+
+    if hasattr(state_dict, "_metadata"):
+        migrated._metadata = state_dict._metadata
+    return (migrated, changed) if changed else (state_dict, False)
 
 
 def set_requires_grad(model, requires_grad):
@@ -105,26 +129,45 @@ def load_relat_e_checkpoint(
     use_ema=False,
 ):
     ckpt = _safe_torch_load(path, map_location=map_location, weights_only=True)
+    migrated_generator = False
     if use_ema and "ema_vae_rgb" in ckpt:
         unwrap_model(rgb_vae).load_state_dict(ckpt["ema_vae_rgb"])
         unwrap_model(depth_vae).load_state_dict(ckpt["ema_vae_depth"])
-        unwrap_model(generator).load_state_dict(ckpt["ema_generator"])
+        generator_state, migrated = _migrate_relat_mot_generator_state_dict(ckpt["ema_generator"])
+        migrated_generator = migrated_generator or migrated
+        unwrap_model(generator).load_state_dict(generator_state)
     else:
         unwrap_model(rgb_vae).load_state_dict(ckpt["vae_rgb_model"])
         unwrap_model(depth_vae).load_state_dict(ckpt["vae_depth_model"])
-        unwrap_model(generator).load_state_dict(ckpt["generator_model"])
+        generator_state, migrated = _migrate_relat_mot_generator_state_dict(ckpt["generator_model"])
+        migrated_generator = migrated_generator or migrated
+        unwrap_model(generator).load_state_dict(generator_state)
     if ema_rgb_vae is not None and "ema_vae_rgb" in ckpt:
         ema_rgb_vae.load_state_dict(ckpt["ema_vae_rgb"])
     if ema_depth_vae is not None and "ema_vae_depth" in ckpt:
         ema_depth_vae.load_state_dict(ckpt["ema_vae_depth"])
     if ema_generator is not None and "ema_generator" in ckpt:
-        ema_generator.load_state_dict(ckpt["ema_generator"])
+        ema_generator_state, migrated = _migrate_relat_mot_generator_state_dict(ckpt["ema_generator"])
+        migrated_generator = migrated_generator or migrated
+        ema_generator.load_state_dict(ema_generator_state)
     if opt_rgb_vae is not None and "opt_rgb_vae" in ckpt:
         opt_rgb_vae.load_state_dict(ckpt["opt_rgb_vae"])
     if opt_depth_vae is not None and "opt_depth_vae" in ckpt:
         opt_depth_vae.load_state_dict(ckpt["opt_depth_vae"])
     if opt_generator is not None and "opt_generator" in ckpt:
-        opt_generator.load_state_dict(ckpt["opt_generator"])
+        if migrated_generator:
+            warnings.warn(
+                "Skipping generator optimizer state because the checkpoint used the legacy shared_stream layout.",
+                RuntimeWarning,
+            )
+        else:
+            try:
+                opt_generator.load_state_dict(ckpt["opt_generator"])
+            except ValueError as exc:
+                warnings.warn(
+                    f"Skipping incompatible generator optimizer state: {exc}",
+                    RuntimeWarning,
+                )
     return int(ckpt.get("step", 0))
 
 

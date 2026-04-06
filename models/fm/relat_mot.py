@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from models.fm.DiT import DiTBlock, FinalLayer
+from models.fm.DiT import DiTBlock, FinalLayer, modulate
 from models.fm.utils import timestep_embedding
 
 
@@ -116,6 +117,161 @@ class DiTStream(nn.Module):
         return x, hidden
 
 
+class SharedMoTBlock(nn.Module):
+    def __init__(
+        self,
+        hidden_size,
+        num_heads,
+        use_qknorm=True,
+        use_swiglu=True,
+        use_rmsnorm=True,
+        wo_shift=True,
+        fused_attn=True,
+    ):
+        super().__init__()
+        self.rgb_block = DiTBlock(
+            hidden_size,
+            num_heads,
+            use_qknorm=use_qknorm,
+            use_swiglu=use_swiglu,
+            use_rmsnorm=use_rmsnorm,
+            wo_shift=wo_shift,
+            fused_attn=fused_attn,
+        )
+        self.depth_block = DiTBlock(
+            hidden_size,
+            num_heads,
+            use_qknorm=use_qknorm,
+            use_swiglu=use_swiglu,
+            use_rmsnorm=use_rmsnorm,
+            wo_shift=wo_shift,
+            fused_attn=fused_attn,
+        )
+
+    @staticmethod
+    def _modulation(block, t_emb):
+        if block.wo_shift:
+            scale_msa, gate_msa, scale_mlp, gate_mlp = block.adaLN_modulation(t_emb).chunk(4, dim=1)
+            shift_msa = None
+            shift_mlp = None
+        else:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.adaLN_modulation(t_emb).chunk(6, dim=1)
+        return shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+    @staticmethod
+    def _project_qkv(block, x, feat_rope=None):
+        attn = block.attn
+        b, n_tokens, channels = x.shape
+        qkv = attn.qkv(x).reshape(b, n_tokens, 3, attn.num_heads, attn.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q, k = attn.q_norm(q), attn.k_norm(k)
+        if feat_rope is not None:
+            q = feat_rope(q)
+            k = feat_rope(k)
+        return q, k, v, channels
+
+    @staticmethod
+    def _shared_attention(attn, q, k, v):
+        if attn.fused_attn and hasattr(F, "scaled_dot_product_attention"):
+            return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        q = q * attn.scale
+        scores = q @ k.transpose(-2, -1)
+        weights = scores.softmax(dim=-1)
+        return weights @ v
+
+    @staticmethod
+    def _merge_heads(x, n_tokens, channels):
+        return x.transpose(1, 2).reshape(x.size(0), n_tokens, channels)
+
+    def forward(self, rgb, depth, t_rgb_emb, t_depth_emb, feat_rope=None):
+        rgb_shift_msa, rgb_scale_msa, rgb_gate_msa, rgb_shift_mlp, rgb_scale_mlp, rgb_gate_mlp = self._modulation(
+            self.rgb_block, t_rgb_emb
+        )
+        depth_shift_msa, depth_scale_msa, depth_gate_msa, depth_shift_mlp, depth_scale_mlp, depth_gate_mlp = self._modulation(
+            self.depth_block, t_depth_emb
+        )
+
+        rgb_attn_in = modulate(self.rgb_block.norm1(rgb), rgb_shift_msa, rgb_scale_msa)
+        depth_attn_in = modulate(self.depth_block.norm1(depth), depth_shift_msa, depth_scale_msa)
+        q_rgb, k_rgb, v_rgb, channels = self._project_qkv(self.rgb_block, rgb_attn_in, feat_rope=feat_rope)
+        q_depth, k_depth, v_depth, _ = self._project_qkv(self.depth_block, depth_attn_in, feat_rope=feat_rope)
+
+        q = torch.cat([q_rgb, q_depth], dim=2)
+        k = torch.cat([k_rgb, k_depth], dim=2)
+        v = torch.cat([v_rgb, v_depth], dim=2)
+        y = self._shared_attention(self.rgb_block.attn, q, k, v)
+        y_rgb, y_depth = torch.split(y, [rgb.size(1), depth.size(1)], dim=2)
+
+        y_rgb = self._merge_heads(y_rgb, rgb.size(1), channels)
+        y_depth = self._merge_heads(y_depth, depth.size(1), channels)
+        rgb = rgb + rgb_gate_msa.unsqueeze(1) * self.rgb_block.attn.proj(y_rgb)
+        depth = depth + depth_gate_msa.unsqueeze(1) * self.depth_block.attn.proj(y_depth)
+
+        rgb_mlp_in = modulate(self.rgb_block.norm2(rgb), rgb_shift_mlp, rgb_scale_mlp)
+        depth_mlp_in = modulate(self.depth_block.norm2(depth), depth_shift_mlp, depth_scale_mlp)
+        rgb = rgb + rgb_gate_mlp.unsqueeze(1) * self.rgb_block.mlp(rgb_mlp_in)
+        depth = depth + depth_gate_mlp.unsqueeze(1) * self.depth_block.mlp(depth_mlp_in)
+        return rgb, depth
+
+
+class SharedMoTStream(nn.Module):
+    def __init__(
+        self,
+        hidden_size,
+        depth,
+        num_heads,
+        use_qknorm=True,
+        use_swiglu=True,
+        use_rmsnorm=True,
+        wo_shift=True,
+        fused_attn=True,
+        use_rope=False,
+        frames=4,
+        input_size=16,
+        use_checkpoint=False,
+    ):
+        super().__init__()
+        self.use_checkpoint = use_checkpoint
+        self.blocks = nn.ModuleList(
+            [
+                SharedMoTBlock(
+                    hidden_size,
+                    num_heads,
+                    use_qknorm=use_qknorm,
+                    use_swiglu=use_swiglu,
+                    use_rmsnorm=use_rmsnorm,
+                    wo_shift=wo_shift,
+                    fused_attn=fused_attn,
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.feat_rope = VolumeRoPE(hidden_size // num_heads, frames, input_size) if use_rope else None
+
+    def _run_block(self, block, rgb, depth, t_rgb_emb, t_depth_emb):
+        if self.use_checkpoint and self.training:
+            return checkpoint(
+                lambda rgb_, depth_, t_rgb_, t_depth_: block(
+                    rgb_,
+                    depth_,
+                    t_rgb_,
+                    t_depth_,
+                    feat_rope=self.feat_rope,
+                ),
+                rgb,
+                depth,
+                t_rgb_emb,
+                t_depth_emb,
+                use_reentrant=False,
+            )
+        return block(rgb, depth, t_rgb_emb, t_depth_emb, feat_rope=self.feat_rope)
+
+    def forward(self, rgb, depth, t_rgb_emb, t_depth_emb):
+        for block in self.blocks:
+            rgb, depth = self._run_block(block, rgb, depth, t_rgb_emb, t_depth_emb)
+        return rgb, depth
+
+
 class ReLaTMoT(nn.Module):
     def __init__(
         self,
@@ -188,7 +344,7 @@ class ReLaTMoT(nn.Module):
         )
         self.to_shared_rgb = nn.Linear(hidden_size, hidden_size)
         self.to_shared_depth = nn.Linear(hidden_size, hidden_size)
-        self.shared_stream = DiTStream(
+        self.shared_stream = SharedMoTStream(
             hidden_size=hidden_size,
             depth=depth,
             num_heads=num_heads,
@@ -219,10 +375,14 @@ class ReLaTMoT(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
-        for stream in (self.rgb_stream, self.depth_stream, self.shared_stream):
+        for stream in (self.rgb_stream, self.depth_stream):
             for block in stream.blocks:
                 nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
                 nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        for block in self.shared_stream.blocks:
+            for branch in (block.rgb_block, block.depth_block):
+                nn.init.constant_(branch.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(branch.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.rgb_final.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.rgb_final.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.rgb_final.linear.weight, 0)
@@ -244,13 +404,12 @@ class ReLaTMoT(nn.Module):
     def _time_embeddings(self, t_rgb, t_depth):
         t_rgb_emb = self.t_embedder(timestep_embedding(t_rgb, self.pos_embed.size(-1)).to(self.pos_embed.dtype))
         t_depth_emb = self.t_embedder(timestep_embedding(t_depth, self.pos_embed.size(-1)).to(self.pos_embed.dtype))
-        t_shared = 0.5 * (t_rgb_emb + t_depth_emb)
-        return t_rgb_emb, t_depth_emb, t_shared
+        return t_rgb_emb, t_depth_emb
 
-    def _fuse_streams(self, rgb, depth, t_shared):
-        shared = torch.cat([self.to_shared_rgb(rgb), self.to_shared_depth(depth)], dim=1)
-        shared, _ = self.shared_stream(shared, t_shared, capture_layer=None)
-        shared_rgb, shared_depth = torch.split(shared, [rgb.size(1), depth.size(1)], dim=1)
+    def _fuse_streams(self, rgb, depth, t_rgb_emb, t_depth_emb):
+        shared_rgb = self.to_shared_rgb(rgb)
+        shared_depth = self.to_shared_depth(depth)
+        shared_rgb, shared_depth = self.shared_stream(shared_rgb, shared_depth, t_rgb_emb, t_depth_emb)
         rgb = rgb + self.from_shared_rgb(shared_rgb)
         depth = depth + self.from_shared_depth(shared_depth)
         return rgb, depth
@@ -269,14 +428,14 @@ class ReLaTMoT(nn.Module):
             t_rgb = torch.zeros(z_rgb_t.size(0), device=z_rgb_t.device, dtype=z_rgb_t.dtype)
         if t_depth is None:
             t_depth = t_rgb
-        t_rgb_emb, t_depth_emb, t_shared = self._time_embeddings(t_rgb, t_depth)
+        t_rgb_emb, t_depth_emb = self._time_embeddings(t_rgb, t_depth)
 
         rgb = self._prepare_tokens(z_rgb_t, cond_rgb, self.rgb_embedder, modality_index=0)
         depth = self._prepare_tokens(z_depth_t, cond_depth, self.depth_embedder, modality_index=1)
 
         rgb, hidden_rgb = self.rgb_stream(rgb, t_rgb_emb, capture_layer=self.aligned_depth)
         depth, hidden_depth = self.depth_stream(depth, t_depth_emb, capture_layer=self.aligned_depth)
-        rgb, depth = self._fuse_streams(rgb, depth, t_shared)
+        rgb, depth = self._fuse_streams(rgb, depth, t_rgb_emb, t_depth_emb)
 
         v_rgb = self.rgb_final(rgb, t_rgb_emb).transpose(1, 2)
         v_depth = self.depth_final(depth, t_depth_emb).transpose(1, 2)
