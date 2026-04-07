@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from models.fm.DiT import DiTBlock, FinalLayer, modulate
+from models.fm.DiT import DiTBlock, FinalLayer, RMSNorm, SwiGLUFFN, modulate
 from models.fm.utils import timestep_embedding
 
 
@@ -64,6 +64,23 @@ class TokenProjectionHead(nn.Module):
         return self.net(hidden.transpose(1, 2)).transpose(1, 2)
 
 
+def _resolve_depth_hidden_size(hidden_size, num_heads, depth_width_ratio):
+    if isinstance(depth_width_ratio, float) and not depth_width_ratio.is_integer():
+        raise ValueError("depth_width_ratio must be an integer value.")
+    depth_width_ratio = int(depth_width_ratio)
+    if depth_width_ratio < 1:
+        raise ValueError("depth_width_ratio must be >= 1.")
+    if hidden_size % depth_width_ratio != 0:
+        raise ValueError(f"hidden_size={hidden_size} must be divisible by depth_width_ratio={depth_width_ratio}.")
+    depth_hidden_size = hidden_size // depth_width_ratio
+    if depth_hidden_size % num_heads != 0:
+        raise ValueError(
+            f"depth_hidden_size={depth_hidden_size} must be divisible by num_heads={num_heads}; "
+            "choose a depth_width_ratio that preserves head divisibility."
+        )
+    return depth_width_ratio, depth_hidden_size
+
+
 class DiTStream(nn.Module):
     def __init__(
         self,
@@ -117,10 +134,92 @@ class DiTStream(nn.Module):
         return x, hidden
 
 
-class SharedMoTBlock(nn.Module):
+class SharedMoTAttention(nn.Module):
+    def __init__(
+        self,
+        in_dim,
+        attn_dim,
+        num_heads,
+        qkv_bias=True,
+        qk_norm=False,
+        use_rmsnorm=False,
+        fused_attn=True,
+    ):
+        super().__init__()
+        assert attn_dim % num_heads == 0, "attn_dim should be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = attn_dim // num_heads
+        self.attn_dim = attn_dim
+        self.scale = self.head_dim ** -0.5
+        self.fused_attn = fused_attn
+
+        self.qkv = nn.Linear(in_dim, attn_dim * 3, bias=qkv_bias)
+        norm_layer = RMSNorm if use_rmsnorm else nn.LayerNorm
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.proj = nn.Linear(attn_dim, in_dim)
+
+
+class SharedMoTBranch(nn.Module):
     def __init__(
         self,
         hidden_size,
+        attn_hidden_size,
+        num_heads,
+        mlp_ratio=4.0,
+        use_qknorm=False,
+        use_swiglu=False,
+        use_rmsnorm=False,
+        wo_shift=False,
+        fused_attn=True,
+    ):
+        super().__init__()
+        if not use_rmsnorm:
+            self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        else:
+            self.norm1 = RMSNorm(hidden_size)
+            self.norm2 = RMSNorm(hidden_size)
+
+        self.attn = SharedMoTAttention(
+            hidden_size,
+            attn_hidden_size,
+            num_heads=num_heads,
+            qkv_bias=True,
+            qk_norm=use_qknorm,
+            use_rmsnorm=use_rmsnorm,
+            fused_attn=fused_attn,
+        )
+
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        if use_swiglu:
+            self.mlp = SwiGLUFFN(hidden_size, int(2 / 3 * mlp_hidden_dim))
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(hidden_size, mlp_hidden_dim),
+                nn.GELU(),
+                nn.Linear(mlp_hidden_dim, hidden_size),
+            )
+
+        self.wo_shift = wo_shift
+        if wo_shift:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 4 * hidden_size, bias=True),
+            )
+        else:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 6 * hidden_size, bias=True),
+            )
+
+
+class SharedMoTBlock(nn.Module):
+    def __init__(
+        self,
+        rgb_hidden_size,
+        depth_hidden_size,
+        attn_hidden_size,
         num_heads,
         use_qknorm=True,
         use_swiglu=True,
@@ -129,8 +228,9 @@ class SharedMoTBlock(nn.Module):
         fused_attn=True,
     ):
         super().__init__()
-        self.rgb_block = DiTBlock(
-            hidden_size,
+        self.rgb_block = SharedMoTBranch(
+            rgb_hidden_size,
+            attn_hidden_size,
             num_heads,
             use_qknorm=use_qknorm,
             use_swiglu=use_swiglu,
@@ -138,8 +238,9 @@ class SharedMoTBlock(nn.Module):
             wo_shift=wo_shift,
             fused_attn=fused_attn,
         )
-        self.depth_block = DiTBlock(
-            hidden_size,
+        self.depth_block = SharedMoTBranch(
+            depth_hidden_size,
+            attn_hidden_size,
             num_heads,
             use_qknorm=use_qknorm,
             use_swiglu=use_swiglu,
@@ -161,14 +262,14 @@ class SharedMoTBlock(nn.Module):
     @staticmethod
     def _project_qkv(block, x, feat_rope=None):
         attn = block.attn
-        b, n_tokens, channels = x.shape
+        b, n_tokens, _ = x.shape
         qkv = attn.qkv(x).reshape(b, n_tokens, 3, attn.num_heads, attn.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = attn.q_norm(q), attn.k_norm(k)
         if feat_rope is not None:
             q = feat_rope(q)
             k = feat_rope(k)
-        return q, k, v, channels
+        return q, k, v, attn.attn_dim
 
     @staticmethod
     def _shared_attention(attn, q, k, v):
@@ -217,7 +318,9 @@ class SharedMoTBlock(nn.Module):
 class SharedMoTStream(nn.Module):
     def __init__(
         self,
-        hidden_size,
+        rgb_hidden_size,
+        depth_hidden_size,
+        attn_hidden_size,
         depth,
         num_heads,
         use_qknorm=True,
@@ -235,7 +338,9 @@ class SharedMoTStream(nn.Module):
         self.blocks = nn.ModuleList(
             [
                 SharedMoTBlock(
-                    hidden_size,
+                    rgb_hidden_size,
+                    depth_hidden_size,
+                    attn_hidden_size,
                     num_heads,
                     use_qknorm=use_qknorm,
                     use_swiglu=use_swiglu,
@@ -246,7 +351,7 @@ class SharedMoTStream(nn.Module):
                 for _ in range(depth)
             ]
         )
-        self.feat_rope = VolumeRoPE(hidden_size // num_heads, frames, input_size) if use_rope else None
+        self.feat_rope = VolumeRoPE(attn_hidden_size // num_heads, frames, input_size) if use_rope else None
 
     def _run_block(self, block, rgb, depth, t_rgb_emb, t_depth_emb):
         if self.use_checkpoint and self.training:
@@ -291,6 +396,7 @@ class ReLaTMoT(nn.Module):
         fused_attn=True,
         use_rope=False,
         same_noise=True,
+        depth_width_ratio=1,
         use_checkpoint=False,
     ):
         super().__init__()
@@ -300,19 +406,32 @@ class ReLaTMoT(nn.Module):
         self.input_size = input_size
         self.aligned_depth = aligned_depth
         self.same_noise = same_noise
+        self.hidden_size = hidden_size
+        self.depth_width_ratio, self.depth_hidden_size = _resolve_depth_hidden_size(
+            hidden_size,
+            num_heads,
+            depth_width_ratio,
+        )
 
         self.seq_len = frames * input_size * input_size
         self.ae_emb_dim = self.seq_len
 
         self.rgb_embedder = nn.Linear(in_channels * 2, hidden_size)
-        self.depth_embedder = nn.Linear(in_channels * 2, hidden_size)
+        self.depth_embedder = nn.Linear(in_channels * 2, self.depth_hidden_size)
         self.t_embedder = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size),
         )
+        self.depth_t_embedder = nn.Sequential(
+            nn.Linear(self.depth_hidden_size, self.depth_hidden_size),
+            nn.SiLU(),
+            nn.Linear(self.depth_hidden_size, self.depth_hidden_size),
+        )
         self.pos_embed = nn.Parameter(torch.zeros(1, self.seq_len, hidden_size))
+        self.depth_pos_embed = nn.Parameter(torch.zeros(1, self.seq_len, self.depth_hidden_size))
         self.modality_embed = nn.Embedding(2, hidden_size)
+        self.depth_modality_embed = nn.Parameter(torch.zeros(1, 1, self.depth_hidden_size))
 
         self.rgb_stream = DiTStream(
             hidden_size=hidden_size,
@@ -329,7 +448,7 @@ class ReLaTMoT(nn.Module):
             use_checkpoint=use_checkpoint,
         )
         self.depth_stream = DiTStream(
-            hidden_size=hidden_size,
+            hidden_size=self.depth_hidden_size,
             depth=depth,
             num_heads=num_heads,
             use_qknorm=use_qknorm,
@@ -343,9 +462,11 @@ class ReLaTMoT(nn.Module):
             use_checkpoint=use_checkpoint,
         )
         self.to_shared_rgb = nn.Linear(hidden_size, hidden_size)
-        self.to_shared_depth = nn.Linear(hidden_size, hidden_size)
+        self.to_shared_depth = nn.Linear(self.depth_hidden_size, self.depth_hidden_size)
         self.shared_stream = SharedMoTStream(
-            hidden_size=hidden_size,
+            rgb_hidden_size=hidden_size,
+            depth_hidden_size=self.depth_hidden_size,
+            attn_hidden_size=hidden_size,
             depth=depth,
             num_heads=num_heads,
             use_qknorm=use_qknorm,
@@ -359,17 +480,19 @@ class ReLaTMoT(nn.Module):
             use_checkpoint=use_checkpoint,
         )
         self.from_shared_rgb = nn.Linear(hidden_size, hidden_size)
-        self.from_shared_depth = nn.Linear(hidden_size, hidden_size)
+        self.from_shared_depth = nn.Linear(self.depth_hidden_size, self.depth_hidden_size)
 
         self.rgb_relation_head = TokenProjectionHead(hidden_size, rgb_teacher_dim)
-        self.depth_relation_head = TokenProjectionHead(hidden_size, depth_teacher_dim)
+        self.depth_relation_head = TokenProjectionHead(self.depth_hidden_size, depth_teacher_dim)
         self.rgb_final = FinalLayer(hidden_size, self.out_channels, use_rmsnorm=use_rmsnorm)
-        self.depth_final = FinalLayer(hidden_size, self.out_channels, use_rmsnorm=use_rmsnorm)
+        self.depth_final = FinalLayer(self.depth_hidden_size, self.out_channels, use_rmsnorm=use_rmsnorm)
         self.initialize_weights()
 
     def initialize_weights(self):
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.depth_pos_embed, std=0.02)
         nn.init.trunc_normal_(self.modality_embed.weight, std=0.02)
+        nn.init.trunc_normal_(self.depth_modality_embed, std=0.02)
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -392,18 +515,17 @@ class ReLaTMoT(nn.Module):
         nn.init.constant_(self.depth_final.linear.weight, 0)
         nn.init.constant_(self.depth_final.linear.bias, 0)
 
-    def _prepare_tokens(self, x, cond, embedder, modality_index):
+    def _prepare_tokens(self, x, cond, embedder, pos_embed, modality_embed):
         if cond is None:
             cond = torch.zeros_like(x)
         x = torch.cat([x, cond], dim=1).transpose(1, 2)
         x = embedder(x)
-        x = x + self.pos_embed[:, : x.size(1)]
-        modality = self.modality_embed.weight[modality_index].view(1, 1, -1)
-        return x + modality
+        x = x + pos_embed[:, : x.size(1)]
+        return x + modality_embed.view(1, 1, -1)
 
     def _time_embeddings(self, t_rgb, t_depth):
-        t_rgb_emb = self.t_embedder(timestep_embedding(t_rgb, self.pos_embed.size(-1)).to(self.pos_embed.dtype))
-        t_depth_emb = self.t_embedder(timestep_embedding(t_depth, self.pos_embed.size(-1)).to(self.pos_embed.dtype))
+        t_rgb_emb = self.t_embedder(timestep_embedding(t_rgb, self.hidden_size).to(self.pos_embed.dtype))
+        t_depth_emb = self.depth_t_embedder(timestep_embedding(t_depth, self.depth_hidden_size).to(self.depth_pos_embed.dtype))
         return t_rgb_emb, t_depth_emb
 
     def _fuse_streams(self, rgb, depth, t_rgb_emb, t_depth_emb):
@@ -430,8 +552,20 @@ class ReLaTMoT(nn.Module):
             t_depth = t_rgb
         t_rgb_emb, t_depth_emb = self._time_embeddings(t_rgb, t_depth)
 
-        rgb = self._prepare_tokens(z_rgb_t, cond_rgb, self.rgb_embedder, modality_index=0)
-        depth = self._prepare_tokens(z_depth_t, cond_depth, self.depth_embedder, modality_index=1)
+        rgb = self._prepare_tokens(
+            z_rgb_t,
+            cond_rgb,
+            self.rgb_embedder,
+            self.pos_embed,
+            self.modality_embed.weight[0],
+        )
+        depth = self._prepare_tokens(
+            z_depth_t,
+            cond_depth,
+            self.depth_embedder,
+            self.depth_pos_embed,
+            self.depth_modality_embed,
+        )
 
         rgb, hidden_rgb = self.rgb_stream(rgb, t_rgb_emb, capture_layer=self.aligned_depth)
         depth, hidden_depth = self.depth_stream(depth, t_depth_emb, capture_layer=self.aligned_depth)

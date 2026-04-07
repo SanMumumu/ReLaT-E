@@ -47,4 +47,6 @@ Generator scaling presets are:
 - `base`: `hidden_size=768`, `depth=12`, `num_heads=12`
 - `large`: `hidden_size=1024`, `depth=16`, `num_heads=16`
 
+Set `generator.mot.depth_width_ratio` to make the depth stream narrower than the RGB stream. For example, `depth_width_ratio: 4` keeps RGB at `hidden_size` and uses `hidden_size / 4` for the depth stream internals.
+
 Evaluation can infer the preset scale from the checkpoint when it matches one of the built-in presets. Use `--model_scale custom` only when you intentionally manage the generator dimensions yourself.

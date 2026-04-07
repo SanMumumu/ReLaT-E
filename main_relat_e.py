@@ -155,6 +155,7 @@ def run(rank, cfg, ckpt_path=None):
             fused_attn=cfg.generator.mot.fused_attn,
             use_rope=cfg.generator.mot.use_rope,
             same_noise=cfg.generator.mot.same_noise,
+            depth_width_ratio=getattr(cfg.generator.mot, "depth_width_ratio", 1),
             use_checkpoint=bool(cfg.optim.save_memory),
         ).to(device)
 

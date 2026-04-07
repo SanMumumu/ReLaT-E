@@ -27,7 +27,24 @@ def unwrap_model(model):
     return model.module if hasattr(model, "module") else model
 
 
-def _migrate_relat_mot_generator_state_dict(state_dict):
+def _state_shape(value):
+    return tuple(value.shape) if hasattr(value, "shape") else None
+
+
+def _target_accepts(target_state_dict, key, value):
+    if target_state_dict is None:
+        return True
+    return key in target_state_dict and _state_shape(target_state_dict[key]) == _state_shape(value)
+
+
+def _maybe_add_migrated_key(migrated, target_state_dict, key, value):
+    if _target_accepts(target_state_dict, key, value):
+        migrated[key] = value
+        return True
+    return False
+
+
+def _migrate_relat_mot_generator_state_dict(state_dict, target_state_dict=None):
     prefix = "shared_stream.blocks."
     branch_prefixes = ("rgb_block.", "depth_block.")
     migrated = OrderedDict()
@@ -38,15 +55,64 @@ def _migrate_relat_mot_generator_state_dict(state_dict):
             block_suffix = key[len(prefix):]
             block_index, sep, branch_key = block_suffix.partition(".")
             if sep and not branch_key.startswith(branch_prefixes):
-                migrated[f"{prefix}{block_index}.rgb_block.{branch_key}"] = value
-                migrated[f"{prefix}{block_index}.depth_block.{branch_key}"] = value
-                changed = True
+                rgb_key = f"{prefix}{block_index}.rgb_block.{branch_key}"
+                depth_key = f"{prefix}{block_index}.depth_block.{branch_key}"
+                changed = _maybe_add_migrated_key(migrated, target_state_dict, rgb_key, value) or changed
+                changed = _maybe_add_migrated_key(migrated, target_state_dict, depth_key, value) or changed
                 continue
         migrated[key] = value
+
+    if "depth_pos_embed" not in migrated and "pos_embed" in state_dict:
+        changed = _maybe_add_migrated_key(migrated, target_state_dict, "depth_pos_embed", state_dict["pos_embed"]) or changed
+    for key, value in state_dict.items():
+        if key.startswith("t_embedder."):
+            depth_key = f"depth_t_embedder.{key[len('t_embedder.'):]}"
+            if depth_key not in migrated:
+                changed = _maybe_add_migrated_key(migrated, target_state_dict, depth_key, value) or changed
+    if "depth_modality_embed" not in migrated and "modality_embed.weight" in state_dict:
+        value = state_dict["modality_embed.weight"]
+        if value.ndim == 2 and value.size(0) > 1:
+            changed = _maybe_add_migrated_key(
+                migrated,
+                target_state_dict,
+                "depth_modality_embed",
+                value[1].view(1, 1, -1),
+            ) or changed
 
     if hasattr(state_dict, "_metadata"):
         migrated._metadata = state_dict._metadata
     return (migrated, changed) if changed else (state_dict, False)
+
+
+def _load_relat_mot_generator_state_dict(generator, state_dict):
+    generator = unwrap_model(generator)
+    target_state = generator.state_dict()
+    migrated_state, migrated = _migrate_relat_mot_generator_state_dict(state_dict, target_state)
+    compatible_state = OrderedDict()
+    skipped = []
+    unexpected = []
+
+    for key, value in migrated_state.items():
+        if key not in target_state:
+            unexpected.append(key)
+            continue
+        if _state_shape(target_state[key]) != _state_shape(value):
+            skipped.append(key)
+            continue
+        compatible_state[key] = value
+
+    incompatible = generator.load_state_dict(compatible_state, strict=False)
+    missing = list(incompatible.missing_keys)
+    unexpected.extend(list(incompatible.unexpected_keys))
+    architecture_changed = migrated or bool(skipped or missing or unexpected)
+    if skipped or missing or unexpected:
+        preview = ", ".join((skipped + missing + unexpected)[:8])
+        warnings.warn(
+            "Loaded generator checkpoint with partial parameter compatibility. "
+            f"Skipped/missing/unexpected keys include: {preview}",
+            RuntimeWarning,
+        )
+    return architecture_changed
 
 
 def set_requires_grad(model, requires_grad):
@@ -133,23 +199,17 @@ def load_relat_e_checkpoint(
     if use_ema and "ema_vae_rgb" in ckpt:
         unwrap_model(rgb_vae).load_state_dict(ckpt["ema_vae_rgb"])
         unwrap_model(depth_vae).load_state_dict(ckpt["ema_vae_depth"])
-        generator_state, migrated = _migrate_relat_mot_generator_state_dict(ckpt["ema_generator"])
-        migrated_generator = migrated_generator or migrated
-        unwrap_model(generator).load_state_dict(generator_state)
+        migrated_generator = _load_relat_mot_generator_state_dict(generator, ckpt["ema_generator"]) or migrated_generator
     else:
         unwrap_model(rgb_vae).load_state_dict(ckpt["vae_rgb_model"])
         unwrap_model(depth_vae).load_state_dict(ckpt["vae_depth_model"])
-        generator_state, migrated = _migrate_relat_mot_generator_state_dict(ckpt["generator_model"])
-        migrated_generator = migrated_generator or migrated
-        unwrap_model(generator).load_state_dict(generator_state)
+        migrated_generator = _load_relat_mot_generator_state_dict(generator, ckpt["generator_model"]) or migrated_generator
     if ema_rgb_vae is not None and "ema_vae_rgb" in ckpt:
         ema_rgb_vae.load_state_dict(ckpt["ema_vae_rgb"])
     if ema_depth_vae is not None and "ema_vae_depth" in ckpt:
         ema_depth_vae.load_state_dict(ckpt["ema_vae_depth"])
     if ema_generator is not None and "ema_generator" in ckpt:
-        ema_generator_state, migrated = _migrate_relat_mot_generator_state_dict(ckpt["ema_generator"])
-        migrated_generator = migrated_generator or migrated
-        ema_generator.load_state_dict(ema_generator_state)
+        migrated_generator = _load_relat_mot_generator_state_dict(ema_generator, ckpt["ema_generator"]) or migrated_generator
     if opt_rgb_vae is not None and "opt_rgb_vae" in ckpt:
         opt_rgb_vae.load_state_dict(ckpt["opt_rgb_vae"])
     if opt_depth_vae is not None and "opt_depth_vae" in ckpt:
@@ -157,7 +217,7 @@ def load_relat_e_checkpoint(
     if opt_generator is not None and "opt_generator" in ckpt:
         if migrated_generator:
             warnings.warn(
-                "Skipping generator optimizer state because the checkpoint used the legacy shared_stream layout.",
+                "Skipping generator optimizer state because the generator architecture changed.",
                 RuntimeWarning,
             )
         else:

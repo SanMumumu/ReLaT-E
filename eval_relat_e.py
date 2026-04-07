@@ -67,6 +67,7 @@ def main():
         fused_attn=cfg.generator.mot.fused_attn,
         use_rope=cfg.generator.mot.use_rope,
         same_noise=cfg.generator.mot.same_noise,
+        depth_width_ratio=getattr(cfg.generator.mot, "depth_width_ratio", 1),
     ).to(device)
     load_relat_e_checkpoint(args.ckpt, rgb_vae, depth_vae, generator, map_location=device, use_ema=True)
 

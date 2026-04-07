@@ -61,6 +61,7 @@ generator:
     fused_attn: true
     use_rope: false
     same_noise: true
+    depth_width_ratio: 4
 
 teachers:
   rgb:

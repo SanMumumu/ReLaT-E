@@ -24,7 +24,9 @@ def grad_norm(parameters):
 
 def check_shared_mot_block(device):
     block = SharedMoTBlock(
-        hidden_size=32,
+        rgb_hidden_size=32,
+        depth_hidden_size=16,
+        attn_hidden_size=32,
         num_heads=4,
         use_qknorm=True,
         use_swiglu=True,
@@ -33,9 +35,9 @@ def check_shared_mot_block(device):
         fused_attn=True,
     ).to(device)
     rgb = torch.randn(2, 5, 32, device=device, requires_grad=True)
-    depth = torch.randn(2, 7, 32, device=device, requires_grad=True)
+    depth = torch.randn(2, 7, 16, device=device, requires_grad=True)
     t_rgb = torch.randn(2, 32, device=device)
-    t_depth = torch.randn(2, 32, device=device) + 1.0
+    t_depth = torch.randn(2, 16, device=device) + 1.0
 
     out_rgb, out_depth = block(rgb, depth, t_rgb, t_depth)
     assert out_rgb.shape == rgb.shape
@@ -92,6 +94,7 @@ def main():
         fused_attn=cfg.generator.mot.fused_attn,
         use_rope=cfg.generator.mot.use_rope,
         same_noise=cfg.generator.mot.same_noise,
+        depth_width_ratio=getattr(cfg.generator.mot, "depth_width_ratio", 1),
     ).to(device)
 
     relation_loss = RelationalAlignmentLoss(
